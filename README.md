@@ -64,7 +64,7 @@ A single-page web dashboard for **Collibra Usage Analytics**. It shows what's be
 
 ## Installation
 
-1. Download or clone this repository. You need these three files, kept together in one folder:
+1. Download or clone this repository. You need these three files, kept together in one folder inside the images directory:
 
    ```
    usage-dashboard.html
@@ -75,7 +75,7 @@ A single-page web dashboard for **Collibra Usage Analytics**. It shows what's be
 2. Serve the folder from the **same origin** (scheme + host + port) as your Collibra environment. For example:
 
    ```
-   https://collibra.example.com/dashboards/usage-dashboard.html
+   https://collibra.example.com/resources/images/dashboards/usage-dashboard.html
    ```
 
    The dashboard relies on the browser's Collibra session cookie. Browsers only send that cookie automatically to the same origin, so same-origin hosting needs no configuration.
