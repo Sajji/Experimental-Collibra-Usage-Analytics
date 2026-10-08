@@ -337,6 +337,37 @@ main { flex: 1; padding: 20px 24px 32px; outline: none; }
 .delta.down { color: var(--bad); background: var(--bad-soft); }
 .delta.flat { color: var(--text-3); background: var(--bg-sunken); }
 .kpi.skeleton .kpi-value, .kpi.skeleton .kpi-meta { color: transparent; }
+.kpi-label > span { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.kpi-info {
+  flex: none; margin-left: auto; width: 20px; height: 20px; padding: 0; border: 0; border-radius: 50%;
+  display: inline-grid; place-items: center; background: transparent; color: var(--text-3); cursor: pointer;
+}
+.kpi-info svg { width: 15px; height: 15px; fill: currentColor; }
+.kpi-info:hover, .kpi-info:focus-visible { color: var(--brand); background: var(--brand-soft); }
+.card-tools .info-btn:hover, .card-tools .info-btn:focus-visible { color: var(--brand); }
+
+/* ── Stat row (headline numbers inside a card) ────────────────────────── */
+.stat-row { display: grid; grid-template-columns: repeat(auto-fit, minmax(110px, 1fr)); gap: 8px; padding: 2px 16px 8px; }
+.stat { background: var(--bg-sunken); border: 1px solid var(--border); border-radius: var(--radius-sm); padding: 8px 10px; min-width: 0; }
+.stat-value { font-size: 20px; font-weight: 700; line-height: 1.15; font-variant-numeric: tabular-nums; letter-spacing: -.01em; }
+.stat-label { font-size: 11px; font-weight: 600; color: var(--text-3); text-transform: uppercase; letter-spacing: .04em; margin-top: 2px; }
+.stat.primary { background: var(--brand-soft); border-color: transparent; }
+.stat.primary .stat-value { color: var(--brand); font-size: 24px; }
+
+/* ── Info dialog ("How is this calculated?") ──────────────────────────── */
+.info-dialog { font-size: 13.5px; line-height: 1.5; color: var(--text-2); }
+.info-dialog .info-sec + .info-sec { margin-top: 14px; }
+.info-dialog h4 { margin: 0 0 4px; font-size: 11.5px; font-weight: 700; text-transform: uppercase; letter-spacing: .05em; color: var(--text-3); }
+.info-dialog p { margin: 0; }
+.info-dialog p + p, .info-dialog ul + p { margin-top: 6px; }
+.info-dialog ul { margin: 0; padding-left: 18px; }
+.info-dialog li + li { margin-top: 3px; }
+.info-dialog ul.calc { list-style: none; padding: 10px 12px; background: var(--brand-soft); border-radius: var(--radius-sm); color: var(--text); font-variant-numeric: tabular-nums; }
+.info-dialog ul.calc li + li { margin-top: 5px; }
+.info-dialog .formula { margin: 8px 0 0; padding: 8px 10px; background: var(--bg-sunken); border: 1px solid var(--border); border-radius: var(--radius-sm); font-family: var(--mono); font-size: 12px; white-space: pre-wrap; color: var(--text); }
+.info-dialog ul.sources { list-style: none; padding: 0; }
+.info-dialog code { font-family: var(--mono); font-size: 11.5px; background: var(--bg-sunken); border: 1px solid var(--border); border-radius: 5px; padding: 1px 5px; word-break: break-all; }
+.info-dialog .note { font-size: 12px; color: var(--text-3); }
 
 /* ── States ───────────────────────────────────────────────────────────── */
 .skeleton-block {
@@ -487,7 +518,7 @@ main { flex: 1; padding: 20px 24px 32px; outline: none; }
   @page { size: landscape; margin: 12mm; }
   body { background: #fff; color: #000; }
   .controls .control-row-2, .header-actions, .tabs, .card-tools, .card-options, .dt-toolbar, .dt-pager,
-  .skip-link, .toasts, .tooltip, .boot, .banner, .app-footer .muted, .panel-controls, .search-box { display: none !important; }
+  .skip-link, .toasts, .tooltip, .boot, .banner, .app-footer .muted, .panel-controls, .search-box, .kpi-info { display: none !important; }
   .app-header { position: static; border: 0; padding: 0 0 8px; }
   .controls { border: 0; padding: 0 0 8px; }
   .controls select, .controls input { border: 0; padding: 0; appearance: none; }

@@ -17,6 +17,8 @@ A single-page web dashboard for **Collibra Usage Analytics**. It shows what's be
 - [Installation](#installation)
 - [How it finds Collibra](#how-it-finds-collibra)
 - [Using the dashboard](#using-the-dashboard)
+  - [How measures are calculated](#how-measures-are-calculated)
+  - [Unique active users (deduplicated)](#unique-active-users-deduplicated)
 - [Exports](#exports)
 - [Shareable links and saved views](#shareable-links-and-saved-views)
 - [APIs used](#apis-used)
@@ -34,9 +36,9 @@ A single-page web dashboard for **Collibra Usage Analytics**. It shows what's be
 
 | Tab | What it shows |
 |-----|---------------|
-| **Overview** | Headline numbers (visits, active/new/inactive users) with change vs. the comparison period, plus sparklines |
+| **Overview** | Headline numbers (visits, active/new users, visits per user, assets visited, catalog coverage) with change vs. the comparison period, plus sparklines; **Unique active users**; visit trends, content mix and top lists |
 | **Content** | Visits to Assets, Domains, Communities, Dashboards and Diagrams: trends, daily calendar heatmap, weekday profile, breakdown by asset type or community, rising/falling items, and a full ranked list |
-| **Users & Adoption** | Usage rate (High/Medium/Low), retention (Acquired/Retained/Returning), license types, adoption funnel, and per-user detail |
+| **Users & Adoption** | **Unique active users**, usage rate (High/Medium/Low), retention (Acquired/Retained/Returning), license types, adoption funnel, and per-user detail |
 | **Asset Explorer** | Search for any asset and drill into its visits, unique visitors, trend and top visitors |
 | **All-time Popularity** | Collibra's all-time most-viewed assets (navigation statistics) |
 | **Edit Activity** | The audit trail: who changed what, filterable by cause (manual, import, workflow) |
@@ -49,6 +51,7 @@ A single-page web dashboard for **Collibra Usage Analytics**. It shows what's be
 - **Exclusions:** toggles to exclude admins and disabled users.
 - **Audience and content filters:** user groups, roles, license types, communities/domains and asset types.
 - **Interactive charts:** click to zoom, toggle legend items, switch chart type, view as a data table, and go fullscreen.
+- **ⓘ on every measure:** every metric tile, chart and table explains how it's calculated, with the current numbers. See [How measures are calculated](#how-measures-are-calculated).
 - **Light and dark themes,** keyboard shortcuts, and accessible markup (skip link, ARIA roles, keyboard navigation).
 
 ---
@@ -64,7 +67,7 @@ A single-page web dashboard for **Collibra Usage Analytics**. It shows what's be
 
 ## Installation
 
-1. Download or clone this repository. You need these three files, kept together in one folder inside the images directory:
+1. Download or clone this repository. You need these three files, kept together in one folder:
 
    ```
    usage-dashboard.html
@@ -75,7 +78,7 @@ A single-page web dashboard for **Collibra Usage Analytics**. It shows what's be
 2. Serve the folder from the **same origin** (scheme + host + port) as your Collibra environment. For example:
 
    ```
-   https://collibra.example.com/resources/images/dashboards/usage-dashboard.html
+   https://collibra.example.com/dashboards/usage-dashboard.html
    ```
 
    The dashboard relies on the browser's Collibra session cookie. Browsers only send that cookie automatically to the same origin, so same-origin hosting needs no configuration.
@@ -121,6 +124,7 @@ Each candidate is checked with `GET /rest/2.0/auth/sessions/current?include=csrf
 | `R` | Refresh all data |
 | `T` | Toggle dark mode |
 | `/` | Search assets (opens Asset Explorer) |
+| `I` | Explain how the focused chart or metric is calculated |
 | `?` | Show help |
 | `Esc` | Close menus, dialogs and fullscreen |
 
@@ -129,6 +133,36 @@ Each candidate is checked with `GET /rest/2.0/auth/sessions/current?include=csrf
 - **Hide series:** click legend items.
 - **Copy link:** copies a URL that reproduces exactly what you're looking at.
 - **Data freshness:** the header shows when Collibra last refreshed Usage Analytics. Collibra aggregates this data periodically, so today's activity may not appear yet.
+
+### How measures are calculated
+
+Every metric tile, chart and table has an **ⓘ** button. You can also press `I` while it has focus. The ⓘ opens a dialog with:
+
+| Section | Contents |
+|---------|----------|
+| **What it measures** | Plain-language definition. User-type, visit-type, usage-rate and retention definitions use Collibra Usage Analytics' own wording |
+| **How it's calculated** | The method and, where useful, the formula |
+| **In this view** | The calculation worked through with the numbers currently on screen, e.g. "13 user-days ÷ 30 days = 0.4", plus the date range, comparison and filters that apply |
+| **Data source** | The exact API endpoint(s) the value comes from |
+| **Good to know** | Caveats such as data refresh delay, row caps, or whether a count is deduplicated |
+
+**Copy explanation** puts the whole explanation on the clipboard as plain text. Metric exports (CSV/Excel/JSON) also include a **Calculation** column.
+
+### Unique active users (deduplicated)
+
+Collibra's **Active users** figure counts **distinct people**. Two people who each sign in every day of a month are **2** active users. Charts that show users **per day / week / month** count a person in every bucket they were active in. Adding those buckets up gives **user-days** (or user-weeks), not people.
+
+The **Unique active users** card (on Overview and Users & Adoption) shows both side by side:
+
+| Value | Meaning |
+|-------|---------|
+| **Unique active users** | Distinct people with at least one sign-in in the range: Collibra's own count by user ID |
+| **User-days** | Sum of each day's distinct active users. One person active on 5 days counts 5 |
+| **Avg daily active** | User-days ÷ days in the range |
+| **Active days** | Days with at least one active user |
+| **Chart** | Bars: distinct users per bucket. Line: running total of unique people, ending at the headline number |
+
+The card's table/CSV/Excel export lists every bucket plus a **Whole range (deduplicated)** total row.
 
 ---
 
