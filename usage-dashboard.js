@@ -229,6 +229,70 @@
     });
   }
 
+  /* ── Statistics helpers (used by concentration, benchmarks, trends) ── */
+
+  function median(values) {
+    const v = values.filter((x) => x != null && Number.isFinite(x)).sort((a, b) => a - b);
+    if (!v.length) return null;
+    const m = Math.floor(v.length / 2);
+    return v.length % 2 ? v[m] : (v[m - 1] + v[m]) / 2;
+  }
+
+  /** Percentile rank of `value` among `values`: % of values strictly below it, plus half of ties. */
+  function percentileRank(values, value) {
+    if (!values.length) return null;
+    let below = 0, equal = 0;
+    for (const x of values) { if (x < value) below++; else if (x === value) equal++; }
+    return ((below + equal / 2) / values.length) * 100;
+  }
+
+  /** Gini coefficient of non-negative values (0 = perfectly even, 1 = everything in one item). */
+  function gini(values) {
+    const v = values.filter((x) => x > 0).sort((a, b) => a - b);
+    const n = v.length, total = sum(v);
+    if (n < 2 || !total) return n ? 0 : null;
+    let acc = 0;
+    v.forEach((x, i) => { acc += (i + 1) * x; });
+    return (2 * acc) / (n * total) - (n + 1) / n;
+  }
+
+  /** Concentration summary for a list of per-item values. */
+  function concentration(values) {
+    const v = values.filter((x) => x > 0).sort((a, b) => b - a);
+    const total = sum(v), n = v.length;
+    const shareTop = (frac) => (n && total ? (sum(v.slice(0, Math.max(1, Math.ceil(n * frac)))) / total) * 100 : null);
+    let acc = 0, k80 = 0;
+    for (const x of v) { acc += x; k80++; if (acc >= total * 0.8) break; }
+    const curve = [];
+    for (let p = 5; p <= 100; p += 5) {
+      const k = Math.max(1, Math.ceil((n * p) / 100));
+      curve.push({ pct: p, items: Math.min(k, n), share: total ? (sum(v.slice(0, k)) / total) * 100 : 0 });
+    }
+    return { n, total, gini: gini(v), top10: shareTop(0.1), top20: shareTop(0.2), k80: n ? k80 : 0, k80pct: n ? (k80 / n) * 100 : null, curve };
+  }
+
+  /** Least-squares line through (i, values[i]). Returns slope per bucket, intercept, R² and fitted values. */
+  function linearFit(values) {
+    const pts = values.map((v, i) => [i, v]).filter(([, v]) => v != null && Number.isFinite(v));
+    const n = pts.length;
+    if (n < 2) return null;
+    const mx = sum(pts, (p) => p[0]) / n, my = sum(pts, (p) => p[1]) / n;
+    let sxy = 0, sxx = 0, syy = 0;
+    for (const [x, v] of pts) { sxy += (x - mx) * (v - my); sxx += (x - mx) ** 2; syy += (v - my) ** 2; }
+    const slope = sxx ? sxy / sxx : 0;
+    const intercept = my - slope * mx;
+    const r2 = sxx && syy ? (sxy * sxy) / (sxx * syy) : 0;
+    return { slope, intercept, r2, mean: my, fitted: values.map((_, i) => Math.max(0, intercept + slope * i)) };
+  }
+
+  /** Compound growth per bucket between the first and last non-zero buckets, as a %. */
+  function compoundGrowth(values) {
+    const idx = values.map((v, i) => (v > 0 ? i : -1)).filter((i) => i >= 0);
+    if (idx.length < 2) return null;
+    const a = idx[0], b = idx[idx.length - 1];
+    return { pct: ((values[b] / values[a]) ** (1 / (b - a)) - 1) * 100, from: values[a], to: values[b], periods: b - a, first: a, last: b };
+  }
+
   /* ────────────────────────────────────────────────────────────────────────
      CSV parsing (RFC 4180: quoted fields, escaped quotes, embedded commas/newlines)
      ──────────────────────────────────────────────────────────────────────── */
@@ -609,13 +673,19 @@
     last12m: 'Last 12 months', custom: 'Custom',
   };
   const GRANS = ['Auto', 'Day', 'Week', 'Month', 'Quarter'];
-  const TAB_IDS = ['overview', 'content', 'users', 'asset', 'popularity', 'activity', 'ratings'];
+  const TAB_IDS = ['overview', 'content', 'dashboards', 'users', 'asset', 'compare', 'popularity', 'activity', 'ratings'];
+  const COMPARE_KINDS = ['Asset', 'Domain', 'Community', 'Dashboard', 'Diagram'];
+  const MAX_COMPARE = 10;
+  const MAX_TRACKED_USERS = 5;
 
   const DEFAULTS = {
     tab: 'overview', range: 'last30', from: '', to: '', g: 'Auto', cmp: 'previous', xa: false, xd: false,
     f: { groups: [], roles: [], licenses: [], orgs: [], types: [] },
     ctype: 'All', utype: 'Active', asset: '', popN: 500, actCap: 5000, cause: 'All', rscope: 'all',
+    mixOff: [], dsel: [], dmin: 0, dtop: 10, items: [], cmetric: 'visits', cnorm: 'abs', cbench: false, users: [], stale: 180,
   };
+  /** State keys holding lists (serialized as repeated hash parameters). */
+  const LIST_KEYS = ['mixOff', 'dsel', 'items', 'users'];
   /** State keys whose change requires re-fetching data (vs. view-only changes). */
   const DATA_KEYS = ['range', 'from', 'to', 'g', 'cmp', 'xa', 'xd', 'f'];
 
@@ -707,9 +777,11 @@
       if (st.xa) p.set('xa', '1');
       if (st.xd) p.set('xd', '1');
       for (const f of FILTERS) st.f[f.key].forEach((v) => p.append(f.key, v));
-      for (const k of ['ctype', 'utype', 'asset', 'popN', 'actCap', 'cause', 'rscope']) {
+      for (const k of ['ctype', 'utype', 'asset', 'popN', 'actCap', 'cause', 'rscope', 'dmin', 'dtop', 'cmetric', 'cnorm', 'stale']) {
         if (st[k] !== d[k] && st[k] !== '') p.set(k, String(st[k]));
       }
+      if (st.cbench) p.set('cbench', '1');
+      for (const k of LIST_KEYS) (st[k] || []).forEach((v) => p.append(k, v));
       const base = new URLSearchParams(location.hash.replace(/^#/, '')).get('collibraBase');
       if (base) p.set('collibraBase', base);
       return p.toString();
@@ -737,6 +809,17 @@
       num('actCap', [1000, 5000, 10000, 25000, 50000]);
       pick('cause', ['All', 'MANUAL', 'IMPORT', 'WORKFLOW']);
       pick('rscope', ['all', 'range']);
+      st.mixOff = uniq(p.getAll('mixOff').filter((v) => UA.TYPES.includes(v)));
+      if (st.mixOff.length >= UA.TYPES.length) st.mixOff = [];
+      st.dsel = uniq(p.getAll('dsel').filter(isUuid));
+      num('dmin', [0, 1, 5, 10, 50, 100]);
+      num('dtop', [5, 10, 20]);
+      st.items = uniq(p.getAll('items').filter((v) => { const [k, id] = v.split(':'); return COMPARE_KINDS.includes(k) && isUuid(id); })).slice(0, MAX_COMPARE);
+      pick('cmetric', ['visits', 'cumulative', 'share', 'edits']);
+      pick('cnorm', ['abs', 'index', 'pct']);
+      st.cbench = p.get('cbench') === '1';
+      st.users = uniq(p.getAll('users').map((v) => v.trim()).filter(Boolean)).slice(0, MAX_TRACKED_USERS);
+      num('stale', [90, 180, 365]);
       return st;
     },
   };
@@ -998,6 +1081,195 @@
       };
     },
 
+    /* ── Per-bucket detail from row-level downloads (Dashboards, Compare, user tracking) ── */
+
+    _buckets(range, gran) {
+      const buckets = makeBuckets(range.startDate, range.endDate, gran).map((b) => ({ ...b, label: bucketLabel(b, gran), full: bucketFull(b, gran) }));
+      return { buckets, index: new Map(buckets.map((b, i) => [b.bucketStartDate, i])) };
+    },
+    _bucketOf(row, index, gran) {
+      const start = row['Interval Start Date'];
+      return isIsoDate(start) ? index.get(bucketStart(start, gran)) : undefined;
+    },
+    _noIntervals(what) {
+      return new ApiError(`This Collibra version\u2019s ${what} download has no "Interval Start Date" column, so per-period detail isn\u2019t available.`, 200, `${UA.USAGE}/\u2026/download`);
+    },
+
+    /**
+     * Per-item, per-bucket visits for one content type (row-level download at the
+     * chosen granularity). Returns items sorted by visits plus per-bucket totals
+     * and distinct items visited per bucket.
+     */
+    async itemSeries(type, range, gran) {
+      return Api.cached(`itemSeries:${type}:${range.startDate}:${range.endDate}:${gran}:${JSON.stringify(UA.params('usage', range))}`, async () => {
+        const rows = await UA.csv('usage', 'visits/timeSeries/download', { visitType: type, granularity: gran }, range);
+        const { buckets, index } = this._buckets(range, gran);
+        const items = new Map();
+        let placed = 0;
+        for (const r of rows) {
+          const id = r[`${type} Id`] || r[type];
+          if (!id) continue;
+          const i = this._bucketOf(r, index, gran);
+          if (i === undefined) continue;
+          placed++;
+          let it = items.get(id);
+          if (!it) {
+            it = {
+              id, kind: type, name: r[type] || '(unnamed)',
+              assetType: r['Asset Type'] || '',
+              domain: type === 'Domain' ? r[type] : r.Domain || '', domainId: type === 'Domain' ? id : r['Domain Id'] || '',
+              community: type === 'Community' ? r[type] : r.Community || '', communityId: type === 'Community' ? id : r['Community Id'] || '',
+              values: new Array(buckets.length).fill(0), total: 0,
+            };
+            items.set(id, it);
+          }
+          const c = Number(r.Count) || 0;
+          it.values[i] += c;
+          it.total += c;
+        }
+        if (rows.length && !placed) throw this._noIntervals(`${type.toLowerCase()} visit`);
+        const list = [...items.values()].sort((a, b) => b.total - a.total);
+        const totals = buckets.map((_, i) => sum(list, (x) => x.values[i]));
+        const distinct = buckets.map((_, i) => list.reduce((n, x) => n + (x.values[i] > 0 ? 1 : 0), 0));
+        return { type, gran, buckets, items: list, byId: new Map(list.map((x) => [x.id, x])), totals, distinct };
+      });
+    },
+
+    /** Per-user, per-bucket sessions and visits by content type (license-types download). Users are identified by name. */
+    async userSeries(range, gran, userType = 'Active') {
+      return Api.cached(`userSeries:${userType}:${range.startDate}:${range.endDate}:${gran}:${JSON.stringify(UA.params('users', range))}`, async () => {
+        const rows = await UA.csv('users', 'licenseTypes/timeSeries/download', { granularity: gran, userType }, range);
+        const { buckets, index } = this._buckets(range, gran);
+        const users = new Map();
+        const zeros = () => new Array(buckets.length).fill(0);
+        let placed = 0;
+        for (const r of rows) {
+          if (!r.User) continue;
+          const i = this._bucketOf(r, index, gran);
+          if (i === undefined) continue;
+          placed++;
+          let u = users.get(r.User);
+          if (!u) {
+            u = { name: r.User, license: r['Required License'] || '', roles: (r.Roles || '').split(';').map((x) => x.trim()).filter(Boolean), active: zeros(), sessions: zeros(), visits: zeros() };
+            UA.TYPES.forEach((t) => { u[t] = zeros(); });
+            users.set(r.User, u);
+          }
+          u.active[i] = 1;
+          u.sessions[i] += Number(r['Number of Sessions']) || 0;
+          for (const t of UA.TYPES) {
+            const v = Number(r[`${t} Visits`]) || 0;
+            u[t][i] += v;
+            u.visits[i] += v;
+          }
+        }
+        if (rows.length && !placed) throw this._noIntervals('user');
+        const list = [...users.values()].map((u) => {
+          const tot = { sessions: sum(u.sessions), visits: sum(u.visits), activeBuckets: sum(u.active) };
+          UA.TYPES.forEach((t) => { tot[t] = sum(u[t]); });
+          const first = u.active.indexOf(1), last = u.active.lastIndexOf(1);
+          return { ...u, tot, first, last };
+        }).sort((a, b) => b.tot.visits - a.tot.visits);
+        return { gran, buckets, users: list, byName: new Map(list.map((u) => [u.name, u])) };
+      });
+    },
+
+    /** Usage rate and usage days per user per bucket (no Day granularity: Week is used instead). */
+    async rateSeries(range, gran) {
+      const g = gran === 'Day' ? 'Week' : gran;
+      const rows = await UA.csv('users', 'usageRate/timeSeries/download', { granularity: g }, range);
+      const { buckets, index } = this._buckets(range, g);
+      const users = new Map();
+      for (const r of rows) {
+        const i = this._bucketOf(r, index, g);
+        if (!r.User || i === undefined) continue;
+        let u = users.get(r.User);
+        if (!u) { u = { rate: new Array(buckets.length).fill(''), days: new Array(buckets.length).fill(0) }; users.set(r.User, u); }
+        u.rate[i] = r['Usage Rate'] || u.rate[i];
+        u.days[i] += Number(r['Usage Days']) || 0;
+      }
+      return { gran: g, adjusted: g !== gran, buckets, users };
+    },
+
+    /** Retention category (Acquired / Retained / Returning) per user per bucket. */
+    async retentionSeries(range, gran) {
+      const rows = await UA.csv('users', 'userRetention/timeSeries/download', { granularity: gran }, range);
+      const { buckets, index } = this._buckets(range, gran);
+      const users = new Map();
+      for (const r of rows) {
+        const i = this._bucketOf(r, index, gran);
+        if (!r.User || i === undefined) continue;
+        if (!users.has(r.User)) users.set(r.User, new Array(buckets.length).fill(''));
+        if (r.Category) users.get(r.User)[i] = r.Category;
+      }
+      return { buckets, users };
+    },
+
+    /**
+     * Map display names (as used by the Usage Analytics downloads) to Collibra user IDs:
+     * first via the top-users list (ID + full name), then via the REST user search.
+     */
+    async resolveUsers(names, range = State.range()) {
+      const out = new Map();
+      const top = await this.userTop(100, range).catch(soft);
+      for (const t of top || []) if (names.includes(t.name) && isUuid(t.id)) out.set(t.name, t.id);
+      await Promise.all(names.filter((n) => !out.has(n)).map(async (n) => {
+        const parts = n.split(/\s+/).filter(Boolean);
+        try {
+          const r = await Api.get('/rest/2.0/users', { name: parts[parts.length - 1] || n, limit: 50, includeDisabled: true });
+          const hit = (r.results || []).find((u) => [u.firstName, u.lastName].filter(Boolean).join(' ') === n || u.userName === n);
+          if (hit) out.set(n, hit.id);
+        } catch (e) { if (isAbort(e)) throw e; }
+      }));
+      return out;
+    },
+
+    /** Audit-trail events in a range for one user (performedByUserId) or one resource (contextId). */
+    activitiesFor(filter, range, cap = 5000) {
+      const params = {
+        ...filter,
+        startDate: Date.parse(`${range.startDate}T00:00:00`),
+        endDate: Date.parse(`${addDays(range.endDate, 1)}T00:00:00`) - 1,
+      };
+      return Api.cached(`act:${JSON.stringify(params)}:${cap}`, () => Api.paged('/rest/2.0/activities', params, { pageSize: 1000, max: cap })
+        .then((r) => ({ events: r.results.map(normActivity), capped: r.capped })));
+    },
+
+    /** Bucket a list of { date } records into per-bucket counts. */
+    countByBucket(records, range, gran) {
+      const { buckets, index } = this._buckets(range, gran);
+      const values = new Array(buckets.length).fill(0);
+      for (const x of records) {
+        if (!x.date || x.date < range.startDate || x.date > range.endDate) continue;
+        const i = index.get(bucketStart(x.date, gran));
+        if (i !== undefined) values[i]++;
+      }
+      return values;
+    },
+
+    /** Total assets per asset type (exact type, no inheritance) for the given type IDs. */
+    async assetTypeTotals(types) {
+      const out = new Map();
+      await Promise.all(types.filter((t) => isUuid(t.id)).map(async (t) => {
+        try {
+          const r = await Api.get('/rest/2.0/assets', { typeIds: t.id, typeInheritance: false, limit: 1, countLimit: -1 });
+          out.set(t.label, r.total ?? null);
+        } catch (e) { if (isAbort(e)) throw e; out.set(t.label, null); }
+      }));
+      return out;
+    },
+
+    /** Total assets per community ID. */
+    async communityTotals(ids) {
+      const out = new Map();
+      await Promise.all(uniq(ids).filter(isUuid).map(async (id) => {
+        try {
+          const r = await Api.get('/rest/2.0/assets', { communityId: id, limit: 1, countLimit: -1 });
+          out.set(id, r.total ?? null);
+        } catch (e) { if (isAbort(e)) throw e; out.set(id, null); }
+      }));
+      return out;
+    },
+
     async usageRateDetail(range, gran) {
       const g = gran === 'Day' ? 'Week' : gran;
       const rows = await UA.csv('users', 'usageRate/timeSeries/download', { granularity: g }, range);
@@ -1048,12 +1320,13 @@
         domainId: a.domain?.id || '',
         community: a.domain?.parent?.name || '',
         communityId: a.domain?.parent?.id || '',
+        modifiedOn: typeof a.modifiedOn === 'number' ? a.modifiedOn : a.lastModifiedOn || (a.modifiedOn ? Date.parse(a.modifiedOn) : null),
       });
       await Promise.all(chunk(list, 100).map(async (batch) => {
         if (Env.caps.graphql) {
           try {
             const d = await Api.gql(`{ assets(limit: ${batch.length}, where: { id: { in: ${JSON.stringify(batch)} } }) {
-              id displayName type { name } status { name } domain { id name parent { id name } } } }`);
+              id displayName modifiedOn type { name } status { name } domain { id name parent { id name } } } }`);
             for (const a of d.assets || []) out.set(a.id, toCtx(a));
             return;
           } catch (e) {
@@ -1416,8 +1689,9 @@
     const n = cats.length;
     spec.hidden = spec.hidden || new Set();
     const vis = spec.series.filter((se) => !spec.hidden.has(se.name));
-    const main = vis.filter((se) => !se.overlay);
-    const overlays = vis.filter((se) => se.overlay);
+    const main = vis.filter((se) => !se.overlay && !se.y2);
+    const overlays = vis.filter((se) => se.overlay && !se.y2);
+    const right2 = vis.filter((se) => se.y2);
     const mode = spec.mode || 'line';
     const stacked = !!spec.stacked && mode !== 'line' && main.length > 1;
     const fmtY = spec.yFormat || fmtC;
@@ -1439,18 +1713,27 @@
     }
     const ticks = niceTicks(maxV, spec.integer !== false);
     const yMax = ticks[ticks.length - 1] || 1;
+    // Optional secondary (right) axis for series flagged y2, e.g. counts or % next to visits.
+    let maxV2 = 0;
+    right2.forEach((se) => se.values.forEach((v) => { maxV2 = Math.max(maxV2, v || 0); }));
+    const fmtY2 = spec.y2Format || fmtC;
+    const ticks2 = right2.length ? niceTicks(maxV2, spec.y2Integer !== false, ticks.length - 1) : [];
+    const yMax2 = ticks2[ticks2.length - 1] || 1;
     const left = Math.max(...ticks.map((t) => textW(fmtY(t), 11))) + 14;
-    const right = 12, bottom = 26;
+    const right = right2.length ? Math.max(...ticks2.map((t) => textW(fmtY2(t), 11))) + 16 : 12;
+    const bottom = 26;
     const pw = Math.max(10, W - left - right), ph = Math.max(10, H - top - bottom);
     const band = pw / Math.max(n, 1);
     const xC = (i) => left + band * (i + 0.5);
     const y = (v) => top + ph - (v / yMax) * ph;
+    const yR = (v) => top + ph - (v / yMax2) * ph;
 
     const grid = s('g');
     for (const t of ticks) {
       grid.append(s('line', { x1: left, x2: W - right, y1: y(t), y2: y(t), stroke: Theme.v('--grid'), 'stroke-width': 1 }));
       grid.append(svgText(left - 8, y(t) + 4, fmtY(t), { anchor: 'end' }));
     }
+    for (const t of ticks2) grid.append(svgText(W - right + 8, yR(t) + 4, fmtY2(t), { fill: right2[0].color }));
     svg.append(grid);
 
     const maxLab = Math.max(10, ...cats.map((c) => textW(c.label, 11)));
@@ -1505,9 +1788,11 @@
         if (n <= 45) pts.forEach((p) => { if (p[1] != null) plot.append(s('circle', { cx: p[0], cy: p[1], r: n === 1 ? 4 : 2.6, fill: se.color })); });
       }
     }
-    for (const se of overlays) {
-      const pts = se.values.map((v, i) => [xC(i), v == null ? null : y(v)]);
+    for (const se of [...overlays, ...right2]) {
+      const yy = se.y2 ? yR : y;
+      const pts = se.values.map((v, i) => [xC(i), v == null ? null : yy(v)]);
       plot.append(s('path', { d: linePath(pts), fill: 'none', stroke: se.color, 'stroke-width': 2, 'stroke-dasharray': se.dashed ? '5 4' : null, 'stroke-linejoin': 'round' }));
+      if (se.y2 && n <= 45) pts.forEach((p) => { if (p[1] != null) plot.append(s('circle', { cx: p[0], cy: p[1], r: 2.4, fill: se.color })); });
     }
     svg.append(plot);
     svg.append(s('line', { x1: left, x2: W - right, y1: y(0), y2: y(0), stroke: Theme.v('--axis'), 'stroke-width': 1 }));
@@ -1523,10 +1808,12 @@
       cross.setAttribute('x1', xC(i));
       cross.setAttribute('x2', xC(i));
       cross.setAttribute('visibility', 'visible');
-      const rows = (stacked ? [...main].reverse() : main).map((se) => ttRow(se.color, se.name, fmtV(se.values[i] ?? 0)));
+      const fv = (se, v) => (se.format || fmtV)(v);
+      const rows = (stacked ? [...main].reverse() : main).map((se) => ttRow(se.color, se.name, fv(se, se.values[i] ?? 0)));
       let html = `<div class="tt-title">${esc(cats[i].full || cats[i].label)}</div>${rows.join('')}`;
       if (stacked) html += `<div class="tt-sep"></div>${ttRow('', 'Total', fmtV(sum(main, (se) => se.values[i])))}`;
-      if (overlays.length) html += `<div class="tt-sep"></div>${overlays.map((se) => ttRow(se.color, se.name, se.values[i] == null ? '–' : fmtV(se.values[i]))).join('')}`;
+      const extra = [...overlays, ...right2];
+      if (extra.length) html += `<div class="tt-sep"></div>${extra.map((se) => ttRow(se.color, se.name, se.values[i] == null ? '–' : fv(se, se.values[i]))).join('')}`;
       if (spec.tipExtra) html += spec.tipExtra(i);
       Tip.show(e, html);
     });
@@ -2513,6 +2800,7 @@ ${built.map((_, i) => `<Relationship Id="rId${i + 1}" Type="http://schemas.openx
     uaVsNav: 'Navigation statistics are a separate, all-time Collibra counter. They are not the same data as Usage Analytics and can differ from it.',
     actCap: 'The audit trail is loaded newest first up to "Max events". If the cap is reached, older events in the range are not counted.',
     noAudience: 'Audience filters (groups, roles, licenses, admin/disabled exclusions) do not apply to this data.',
+    trend: 'Optional trend line: a least-squares straight line through the buckets, with slope per bucket and R² (how well a straight line fits, 0–1). Compound growth = (last ÷ first non-zero bucket)^(1 ÷ buckets between) − 1. Both are shown under "In this view" when the trend line is on.',
   };
 
   const INFO = {
@@ -2597,7 +2885,7 @@ ${built.map((_, i) => `<Relationship Id="rId${i + 1}" Type="http://schemas.openx
       title: 'Unique active users', scope: 'users',
       what: 'How many different people used Collibra in the period, counted once each, next to how often they came back. If 2 people sign in every day for a month, Unique active users is 2 and user-days is about 60.',
       how: 'Unique active users is Collibra\u2019s own distinct count of user IDs with at least one sign-in in the period. User-days adds up the number of distinct active users on each day. Average daily active users = user-days ÷ calendar days. Active days = days with at least one active user. The chart bars are distinct users per bucket; the line is the running total of distinct people seen so far, which ends at the unique count.',
-      formula: 'User-days = Σ (distinct users active on each day)\nAvg daily active = User-days ÷ days in range\nCumulative unique (bucket n) = people whose first visit in the range is in buckets 1…n',
+      formula: 'User-days = Σ (distinct users active on each day)\nAvg daily active = User-days ÷ days in range\nStickiness = Avg daily active ÷ Unique active users × 100\nCumulative unique (bucket n) = people whose first visit in the range is in buckets 1…n',
       source: [`GET ${UA_S}/summary?summaryUserType=Active (unique)`, `GET ${UA_S}/licenseTypes/timeSeries?granularity=Day&userType=Active (user-days)`, `GET ${UA_S}/licenseTypes/timeSeries/download?userType=Active (per-bucket and cumulative)`],
       caveats: ['The bars count distinct users within each bucket, so a person active in several buckets appears in each bar: the bars add up to user-days (or user-weeks), not people. The headline and the running-total line are deduplicated.', C.nameDedup, C.refresh],
     },
@@ -2605,16 +2893,16 @@ ${built.map((_, i) => `<Relationship Id="rId${i + 1}" Type="http://schemas.openx
     /* ── Overview cards ── */
     'ov-trend': {
       title: 'Visits over time', scope: 'usage',
-      what: 'Visits per time bucket, split by content type.',
-      how: 'Collibra\u2019s visit counts per bucket and content type, stacked. The dashed line (when comparing) is the total for the comparison period, aligned bucket by bucket.',
+      what: 'Visits per time bucket, split by content type. Shows only the content types selected in Content mix.',
+      how: 'Collibra\u2019s visit counts per bucket and content type, stacked. The dashed line (when comparing) is the total of the selected types for the comparison period, aligned bucket by bucket.',
       source: [`GET ${UA_U}/visits/timeSeries`],
-      caveats: [C.visitsNotPeople, 'Partial buckets at the start or end of the range are labelled "partial" and cover fewer days.'],
+      caveats: [C.visitsNotPeople, 'Partial buckets at the start or end of the range are labelled "partial" and cover fewer days.', C.trend],
     },
     'ov-mix': {
       title: 'Content mix', scope: 'usage',
-      what: 'The share of all visits that went to each content type.',
-      how: 'Visits per content type divided by total visits.',
-      formula: 'Share % = Visits to type ÷ Total visits × 100',
+      what: 'The share of visits that went to each content type. Toggle types on or off to see the mix among the remaining types; the selection also applies to "Visits over time".',
+      how: 'Visits per content type divided by the total visits of the selected types. The exported table also shows each type\u2019s share of all visits.',
+      formula: 'Share % = Visits to type ÷ Visits to all selected types × 100',
       source: [`GET ${UA_U}/visits/summary`],
       caveats: [C.visitsNotPeople],
     },
@@ -2659,7 +2947,7 @@ ${built.map((_, i) => `<Relationship Id="rId${i + 1}" Type="http://schemas.openx
       what: 'Visits per time bucket for the selected content type(s).',
       how: 'Collibra\u2019s visit counts per bucket. The dashed line is the comparison period; the optional moving average is the mean of the last N buckets (7 days, 4 weeks, 3 months or 2 quarters).',
       source: [`GET ${UA_U}/visits/timeSeries`],
-      caveats: [C.visitsNotPeople],
+      caveats: [C.visitsNotPeople, C.trend],
     },
     'ct-heatmap': {
       title: 'Daily visit calendar', scope: 'usage',
@@ -2806,7 +3094,7 @@ ${built.map((_, i) => `<Relationship Id="rId${i + 1}" Type="http://schemas.openx
       what: 'Visits to this asset per time bucket.',
       how: 'Collibra\u2019s per-asset visit counts per bucket. The dashed line is the comparison period; the optional moving average is the mean of the last N buckets.',
       source: [`GET ${UA_U}/assets/{id}/visits/timeseries`],
-      caveats: [C.visitsNotPeople],
+      caveats: [C.visitsNotPeople, C.trend],
     },
     'as-visitors': {
       title: 'Top visitors', scope: 'usage',
@@ -3051,6 +3339,307 @@ ${built.map((_, i) => `<Relationship Id="rId${i + 1}" Type="http://schemas.openx
       how: 'Rating records from Collibra; stars = rating × 5. Reviewer names are looked up from user IDs.',
       source: ['GET /rest/2.0/ratings'],
     },
+    'rt-coverage': {
+      title: 'Rating coverage of popular assets', scope: 'usage',
+      what: 'How many of the 100 most-visited assets in the date range have at least one rating. Popular but unrated assets are good candidates to ask for feedback.',
+      how: 'The 100 assets with the most visits in the date range (row-level download) are matched with the rating records by asset ID. Ratings follow the Scope switch (all time or given in the date range).',
+      formula: 'Coverage % = Top assets with ≥ 1 rating ÷ Top assets × 100',
+      source: [`GET ${UA_U}/visits/timeSeries/download?visitType=Asset`, 'GET /rest/2.0/ratings'],
+      caveats: ['Popularity uses the audience filters; ratings don\u2019t.'],
+    },
+
+    /* ── Additional Overview measures ── */
+    'ov-dash-trend': {
+      title: 'Dashboards over time', scope: 'usage',
+      what: 'Dashboard visits per time bucket (bars) and how many different dashboards were opened in each bucket (line, right axis).',
+      how: 'Bars are Collibra\u2019s dashboard visit counts per bucket. The line counts distinct dashboard IDs with at least one visit in each bucket, from the row-level download at the same granularity. The dashed line is dashboard visits in the comparison period, aligned bucket by bucket.',
+      formula: 'Distinct dashboards (bucket) = number of dashboards with visits > 0 in that bucket\nVisits per dashboard = Dashboard visits ÷ distinct dashboards visited in the range',
+      source: [`GET ${UA_U}/visits/timeSeries`, `GET ${UA_U}/visits/timeSeries/download?visitType=Dashboard`],
+      caveats: [C.visitsNotPeople, C.trend, 'Adding up the per-bucket distinct counts counts a dashboard once per bucket it was visited.'],
+    },
+    'ov-diag-trend': {
+      title: 'Diagrams over time', scope: 'usage',
+      what: 'Diagram visits per time bucket (bars) and how many different diagrams were opened in each bucket (line, right axis).',
+      how: 'Bars are Collibra\u2019s diagram visit counts per bucket. The line counts distinct diagram IDs with at least one visit in each bucket, from the row-level download at the same granularity. The dashed line is the comparison period.',
+      formula: 'Distinct diagrams (bucket) = number of diagrams with visits > 0 in that bucket',
+      source: [`GET ${UA_U}/visits/timeSeries`, `GET ${UA_U}/visits/timeSeries/download?visitType=Diagram`],
+      caveats: [C.visitsNotPeople, C.trend],
+    },
+
+    /* ── Shared ── */
+    concentration: {
+      title: 'Concentration of visits', scope: 'usage',
+      what: 'Whether usage is spread across many items or concentrated on a few. The curve shows what share of all visits the top X% of items receive; the diagonal is a perfectly even spread.',
+      how: 'Items with at least one visit are ranked by visits. For every 5% step, the cumulative share of visits of the top items is plotted. The Gini coefficient summarizes the inequality: 0 = every item got the same number of visits, close to 1 = nearly all visits went to one item.',
+      formula: 'Cumulative share (top p%) = Σ visits of the top ⌈n × p⌉ items ÷ total visits × 100\nGini = 2 × Σ(i × xᵢ) ÷ (n × Σx) − (n + 1) ÷ n, with xᵢ sorted ascending, i = 1…n',
+      source: [`GET ${UA_U}/visits/timeSeries/download`],
+      caveats: ['Only items visited at least once are included: never-visited items would make the spread look even more concentrated.'],
+    },
+
+    /* ── Content tab additions ── */
+    'ct-coverage': {
+      title: 'Catalog coverage', scope: 'usage',
+      what: 'The share of the catalog that was visited at least once in the period, per asset type or per community.',
+      how: 'Distinct visited assets come from the row-level asset-visit download and are grouped by asset type or community. Catalog totals are counted with the REST assets API for each group.',
+      formula: 'Coverage % = Distinct assets visited in the group ÷ Assets in the group × 100',
+      source: [`GET ${UA_U}/visits/timeSeries/download?visitType=Asset`, 'GET /rest/2.0/assets?typeIds=…&typeInheritance=false&countLimit=-1', 'GET /rest/2.0/assets?communityId=…&countLimit=-1'],
+      caveats: ['Totals ignore the dashboard filters and include every asset of the group in the catalog.', 'Only groups with at least one visit are listed; community totals are fetched for the 25 most-visited communities.'],
+    },
+    'ct-stale': {
+      title: 'Stale but popular', scope: 'usage',
+      what: 'Popular assets whose content may be outdated: among the 200 most-visited assets in the period, the ones not modified for at least the chosen number of days.',
+      how: 'Top-visited assets from the row-level download are enriched with their last-modified date. Days since modified = today − last modified.',
+      formula: 'Stale = Days since modified ≥ threshold (90, 180 or 365)',
+      source: [`GET ${UA_U}/visits/timeSeries/download?visitType=Asset`, 'POST /graphql/knowledgeGraph/v1 (modifiedOn)'],
+      caveats: ['Collibra\u2019s last-modified date changes with any edit to the asset, including relations and attributes.'],
+    },
+
+    /* ── Dashboards tab ── */
+    'db-visits': {
+      title: 'Dashboard visits', scope: 'usage',
+      what: 'Visits to dashboards in the period, for the dashboards that match the tab\u2019s dashboard filters.',
+      how: 'Sum of per-dashboard visit counts from the row-level download. Change % compares with the same dashboards in the comparison period.',
+      formula: 'Dashboard visits = Σ visits of the dashboards shown',
+      source: [`GET ${UA_U}/visits/timeSeries/download?visitType=Dashboard`],
+      caveats: [C.visitsNotPeople, C.refresh],
+    },
+    'db-count': {
+      title: 'Dashboards visited', scope: 'usage',
+      what: 'How many different dashboards were opened at least once in the period.',
+      how: 'Distinct dashboard IDs in the row-level download, after the dashboard filters (selection and minimum visits).',
+      source: [`GET ${UA_U}/visits/timeSeries/download?visitType=Dashboard`],
+      caveats: ['Collibra doesn\u2019t expose a list of all dashboards, so dashboards that were never visited can\u2019t be counted.'],
+    },
+    'db-avg': {
+      title: 'Visits per dashboard', scope: 'usage',
+      what: 'The average number of visits per visited dashboard.',
+      how: 'Dashboard visits divided by distinct dashboards visited.',
+      formula: 'Visits per dashboard = Dashboard visits ÷ Dashboards visited',
+      source: [`GET ${UA_U}/visits/timeSeries/download?visitType=Dashboard`],
+    },
+    'db-share': {
+      title: 'Share of all visits', scope: 'usage',
+      what: 'What part of all Collibra visits went to the dashboards shown.',
+      how: 'Dashboard visits divided by visits to all content types (assets, domains, communities, dashboards, diagrams).',
+      formula: 'Share % = Dashboard visits ÷ Total visits × 100',
+      source: [`GET ${UA_U}/visits/timeSeries/download?visitType=Dashboard`, `GET ${UA_U}/visits/summary`],
+    },
+    'db-reach': {
+      title: 'Dashboard reach', scope: 'users',
+      what: 'The share of active people who opened at least one dashboard in the period.',
+      how: 'From the per-user download: people with Dashboard Visits > 0, divided by all active people.',
+      formula: 'Reach % = People with ≥ 1 dashboard visit ÷ Active people × 100',
+      source: [`GET ${UA_S}/licenseTypes/timeSeries/download?userType=Active`],
+      caveats: ['Uses all dashboards: the per-user data doesn\u2019t say which dashboard each person opened, so the dashboard picker doesn\u2019t apply.', C.nameDedup],
+    },
+    'db-per-viewer': {
+      title: 'Visits per viewer', scope: 'users',
+      what: 'How many dashboard visits the average dashboard user made.',
+      how: 'Total dashboard visits of people who opened at least one dashboard, divided by the number of those people.',
+      formula: 'Visits per viewer = Σ dashboard visits of viewers ÷ Number of viewers',
+      source: [`GET ${UA_S}/licenseTypes/timeSeries/download?userType=Active`],
+      caveats: [C.nameDedup],
+    },
+    'db-trend': {
+      title: 'Dashboard visits over time', scope: 'usage',
+      what: 'Visits per bucket to the top N dashboards (stacked), with all other dashboards grouped as "Other".',
+      how: 'Per-dashboard, per-bucket visit counts from the row-level download. The dashed line is the total for the same dashboards in the comparison period, aligned bucket by bucket. Optional moving average = mean of the last N buckets.',
+      source: [`GET ${UA_U}/visits/timeSeries/download?visitType=Dashboard&granularity=…`],
+      caveats: [C.visitsNotPeople, C.trend],
+    },
+    'db-distinct': {
+      title: 'Dashboards visited per period', scope: 'usage',
+      what: 'How many different dashboards were opened in each bucket.',
+      how: 'For each bucket, the number of dashboards with at least one visit in that bucket.',
+      source: [`GET ${UA_U}/visits/timeSeries/download?visitType=Dashboard`],
+      caveats: ['Adding the buckets up counts a dashboard once per bucket it was visited.'],
+    },
+    'db-viewers': {
+      title: 'Dashboard viewers over time', scope: 'users',
+      what: 'How many people opened at least one dashboard in each bucket (bars), and what share of that bucket\u2019s active people they were (line, right axis).',
+      how: 'From the per-user, per-bucket download: people with Dashboard Visits > 0 in a bucket, divided by people active in that bucket.',
+      formula: 'Reach % (bucket) = Dashboard viewers in bucket ÷ Active people in bucket × 100',
+      source: [`GET ${UA_S}/licenseTypes/timeSeries/download?userType=Active&granularity=…`],
+      caveats: [C.perBucket, C.nameDedup],
+    },
+    'db-weekday': {
+      title: 'Weekday profile', scope: 'usage',
+      what: 'The average number of dashboard visits on each day of the week.',
+      how: 'Daily dashboard visits (filtered dashboards) summed per weekday and divided by the number of those weekdays in the range.',
+      formula: 'Average (weekday) = Σ dashboard visits on that weekday ÷ number of those weekdays in the range',
+      source: [`GET ${UA_U}/visits/timeSeries/download?visitType=Dashboard&granularity=Day`],
+    },
+    'db-heatmap': {
+      title: 'Dashboard × period heatmap', scope: 'usage',
+      what: 'Visits per bucket for each of the top N dashboards. Darker cells mean more visits.',
+      how: 'Per-dashboard, per-bucket visit counts from the row-level download, shaded relative to the busiest cell.',
+      source: [`GET ${UA_U}/visits/timeSeries/download?visitType=Dashboard`],
+    },
+    'db-lifecycle': {
+      title: 'Dashboard lifecycle', scope: 'usage',
+      what: 'Which dashboards are new, coming back, still in use or no longer used, compared with the comparison period.',
+      how: 'Each dashboard visited in the current or comparison period is classified. A look-back period of the same length, just before the comparison period, separates New from Reactivated.',
+      formula: 'Continuing = visits now > 0 and in comparison > 0\nNew = visits now > 0, none in comparison or look-back\nReactivated = visits now > 0, none in comparison, some in look-back\nDormant = visits in comparison > 0, none now',
+      source: [`GET ${UA_U}/visits/timeSeries/download?visitType=Dashboard (current, comparison and look-back periods)`],
+      caveats: ['"New" means not visited in the comparison or look-back periods. A dashboard could be older but unused for longer than that.', 'Needs "Compare to" set to a comparison period.'],
+    },
+    'db-reach-license': {
+      title: 'Dashboard reach by license type', scope: 'users',
+      what: 'For each license type, the share of its active people who opened at least one dashboard.',
+      how: 'People from the per-user download are grouped by required license; viewers are those with Dashboard Visits > 0.',
+      formula: 'Reach % (license) = Viewers with that license ÷ Active people with that license × 100',
+      source: [`GET ${UA_S}/licenseTypes/timeSeries/download?userType=Active`],
+      caveats: [C.nameDedup],
+    },
+    'db-consumers': {
+      title: 'Top dashboard users', scope: 'users',
+      what: 'The people with the most dashboard visits, and how much of their Collibra use is dashboards.',
+      how: 'Per-user sums of Dashboard Visits and of all visit columns from the per-user download.',
+      formula: 'Dashboard share % = Person\u2019s dashboard visits ÷ Person\u2019s total visits × 100',
+      source: [`GET ${UA_S}/licenseTypes/timeSeries/download?userType=Active`],
+      caveats: [C.nameDedup],
+    },
+    'db-table': {
+      title: 'All dashboards ranked', scope: 'usage',
+      what: 'Every dashboard visited in the period (and, without a minimum-visits filter, those only visited in the comparison period), with trend and lifecycle.',
+      how: 'Per-dashboard totals and per-bucket values from the row-level download. Share % = dashboard visits ÷ visits to all listed dashboards. Rank change = rank in the comparison period − rank now. Active buckets = buckets with at least one visit.',
+      source: [`GET ${UA_U}/visits/timeSeries/download?visitType=Dashboard (current and comparison periods)`],
+      caveats: [C.visitsNotPeople],
+    },
+
+    /* ── Compare tab ── */
+    'cp-trend': {
+      title: 'Compare over time', scope: 'usage',
+      what: 'The chosen metric per bucket for each selected item, optionally against the median of all items of the same kind.',
+      how: 'Visits: assets use the per-asset time series; domains, communities, dashboards and diagrams use the row-level download at the selected granularity. Cumulative = running total. Share of selection = item visits ÷ visits to all selected items in that bucket. Edits = audit-trail events whose context is the item. Normalize: Indexed = value ÷ first non-zero value × 100; % of item total = value ÷ item total × 100. Peer median = per bucket, the median visits of all items of that kind visited at least once in the range.',
+      formula: 'Indexed(t) = value(t) ÷ value(first non-zero) × 100\nShare of selection(t) = item(t) ÷ Σ selected items(t) × 100',
+      source: [`GET ${UA_U}/assets/{id}/visits/timeseries`, `GET ${UA_U}/visits/timeSeries/download?visitType=…`, 'GET /rest/2.0/activities?contextId=…'],
+      caveats: [C.visitsNotPeople, C.trend, 'Edits aren\u2019t available for dashboards.'],
+    },
+    'cp-multiples': {
+      title: 'Small multiples', scope: 'usage',
+      what: 'One small chart per selected item, each with its own scale, so the shape of usage can be compared even when volumes differ a lot.',
+      how: 'Same per-bucket values as the main comparison chart, without normalization.',
+      source: [`GET ${UA_U}/assets/{id}/visits/timeseries`, `GET ${UA_U}/visits/timeSeries/download`],
+    },
+    'cp-share': {
+      title: 'Share of selection over time', scope: 'usage',
+      what: 'How the selected items split their combined visits in each bucket.',
+      how: 'For each bucket: item visits ÷ visits to all selected items in that bucket × 100. Stacked bars add up to 100%.',
+      formula: 'Share(t) = Item visits(t) ÷ Σ selected items\u2019 visits(t) × 100',
+      source: [`GET ${UA_U}/assets/{id}/visits/timeseries`, `GET ${UA_U}/visits/timeSeries/download`],
+    },
+    'cp-edits': {
+      title: 'Edits vs visits', scope: 'usage',
+      what: 'Curation (edits) against consumption (visits) for the selected items, per bucket and per item.',
+      how: 'Edits are audit-trail events in the period whose context is the item; for domains and communities that includes changes to the assets inside. Visits as in the comparison chart.',
+      formula: 'Edits per visit = Edits in period ÷ Visits in period',
+      source: ['GET /rest/2.0/activities?contextId=…&startDate=…&endDate=…', `GET ${UA_U}/assets/{id}/visits/timeseries`],
+      caveats: ['At most 2,000 edits are loaded per item.', 'Audience filters don\u2019t apply to edits.'],
+    },
+    'cp-visitors': {
+      title: 'Top visitors per asset', scope: 'usage',
+      what: 'The five people who visited each selected asset most often in the period.',
+      how: 'Collibra\u2019s per-asset top-visitors list; names are looked up from user IDs.',
+      source: [`GET ${UA_U}/assets/{id}/visitors/top?limit=5`, 'GET /rest/2.0/users/{id}'],
+      caveats: ['Available for assets only.'],
+    },
+    'cp-table': {
+      title: 'Side-by-side comparison', scope: 'usage',
+      what: 'Usage, standing among peers, curation and freshness for every selected item.',
+      how: 'Visits and change come from the item\u2019s time series. Rank in kind and percentile compare the item with all items of the same kind visited in the period (percentile = % of those items with fewer visits, ties counted as half). For assets: all-time visits and unique visitors come from Collibra\u2019s per-asset summary, rating from the ratings API, and freshness from the last-modified date.',
+      formula: 'Percentile = (items with fewer visits + ½ × items with equal visits) ÷ items of kind × 100\nVisits per visitor = All-time visits ÷ Unique visitors\nEdits per visit = Edits ÷ Visits\nStale but popular = Days since modified ≥ threshold and percentile ≥ 80',
+      source: [`GET ${UA_U}/visits/timeSeries/download`, `GET ${UA_U}/assets/{id}/summary`, 'GET /rest/2.0/ratings?assetId=…', 'GET /rest/2.0/activities?contextId=…'],
+      caveats: ['All-time visits and unique visitors are not limited to the date range.'],
+    },
+
+    /* ── Users tab: tracked users ── */
+    'us-track-trend': {
+      title: 'Tracked users over time', scope: 'users',
+      what: 'The chosen measure per bucket for each tracked person, against the median of everyone active in the same bucket.',
+      how: 'Per-user, per-bucket values from the row-level download: sessions, visits by content type, or visits ÷ sessions. The peer median for a bucket is the median among the people active in that bucket.',
+      formula: 'Visits per session(t) = Visits(t) ÷ Sessions(t)\nPeer median(t) = median of the metric over people active in bucket t',
+      source: [`GET ${UA_S}/licenseTypes/timeSeries/download?userType=Active&granularity=…`],
+      caveats: [C.nameDedup, 'People are matched by display name, which is what the download contains.'],
+    },
+    'us-track-mix': {
+      title: 'What tracked users visit', scope: 'users',
+      what: 'For each tracked person, their visits per bucket split by content type, and their usage persona.',
+      how: 'Per-user, per-bucket visit columns (asset, domain, community, dashboard, diagram) from the row-level download.',
+      source: [`GET ${UA_S}/licenseTypes/timeSeries/download?userType=Active`],
+      caveats: ['Usage Analytics doesn\u2019t record which specific assets a person viewed, only how many visits per content type.', C.nameDedup],
+    },
+    'us-track-rate': {
+      title: 'Usage rate & retention by period', scope: 'users',
+      what: 'Each tracked person\u2019s usage rate (High / Medium / Low) and retention category in every bucket.',
+      how: 'Collibra assigns a usage rate per person and bucket from the share of days they were active (High > 50%, Medium 20–50%, Low < 20%) and a retention category (Acquired, Retained, Returning).',
+      source: [`GET ${UA_S}/usageRate/timeSeries/download`, `GET ${UA_S}/userRetention/timeSeries/download`],
+      caveats: ['Usage rate isn\u2019t available per day; with Day granularity weekly buckets are used and retention is omitted.', C.nameDedup],
+    },
+    'us-track-edits': {
+      title: 'Edits by tracked users', scope: 'date',
+      what: 'How many changes each tracked person made in Collibra per bucket (their curation work, next to their consumption).',
+      how: 'Audit-trail events performed by the person in the date range, counted per bucket by event date. The person\u2019s user ID is found from their display name.',
+      source: ['GET /rest/2.0/activities?performedByUserId=…&startDate=…&endDate=…', `GET ${UA_S}/top (name → ID)`, 'GET /rest/2.0/users?name=… (name → ID)'],
+      caveats: ['At most 5,000 events are loaded per person.', 'If a display name can\u2019t be matched to exactly one account, edits aren\u2019t shown for that person.'],
+    },
+    'us-track-ratings': {
+      title: 'Ratings given by tracked users', scope: 'date',
+      what: 'How many ratings each tracked person submitted per bucket.',
+      how: 'Ratings created by the person (by user ID), counted per bucket by creation date.',
+      source: ['GET /rest/2.0/ratings?userId=…'],
+      caveats: ['If a display name can\u2019t be matched to an account, ratings aren\u2019t shown for that person.'],
+    },
+    'us-track-table': {
+      title: 'Tracked users summary', scope: 'users',
+      what: 'One row per tracked person: usage, rank among all active people, persona, usage rate, and contributions.',
+      how: 'Totals from the per-user download. Rank = position by total visits among all active people. Percentile = % of active people with fewer visits (ties count half). Active buckets % = buckets with at least one session ÷ buckets in range.',
+      formula: 'Percentile = (people with fewer visits + ½ × people with equal visits) ÷ active people × 100',
+      source: [`GET ${UA_S}/licenseTypes/timeSeries/download`, `GET ${UA_S}/usageRate/timeSeries/download`, `GET ${UA_S}/userRetention/timeSeries/download`, 'GET /rest/2.0/activities', 'GET /rest/2.0/ratings'],
+      caveats: [C.nameDedup],
+    },
+
+    /* ── Users tab: population ── */
+    'us-stickiness': {
+      title: 'Stickiness (DAU/MAU)', scope: 'users',
+      what: 'How habitual Collibra use is: on a typical day (or week), what share of the month\u2019s users come back. 100% would mean every monthly user is active every day.',
+      how: 'Per calendar month: average daily active users ÷ monthly active users, and average weekly active users ÷ monthly active users. The headline is the average over months with activity.',
+      formula: 'DAU/MAU = (Σ daily active users ÷ days in month) ÷ distinct users in month × 100\nWAU/MAU = (Σ weekly active users ÷ weeks starting in month) ÷ distinct users in month × 100',
+      source: [`GET ${UA_S}/licenseTypes/timeSeries?granularity=Day|Week|Month&userType=Active`],
+      caveats: ['Partial months at the edges of the range only use the days inside the range.', 'Always calculated per month, regardless of the granularity setting.'],
+    },
+    'us-seats': {
+      title: 'License seat utilization', scope: 'users',
+      what: 'For each license type, how many of the known users actually used Collibra in the period. Unused seats may be candidates for re-assignment.',
+      how: 'Active and inactive people from the per-user downloads are grouped by their required license.',
+      formula: 'Utilization % = Active users ÷ (Active + Inactive users) × 100',
+      source: [`GET ${UA_S}/licenseTypes/timeSeries/download?userType=Active`, `GET ${UA_S}/licenseTypes/timeSeries/download?userType=Inactive`],
+      caveats: ['"Required license" is the license a person\u2019s roles require, as reported by Usage Analytics, not necessarily a purchased seat.', 'Use "Exclude disabled users" to leave disabled accounts out.', C.nameDedup],
+    },
+    'us-churn': {
+      title: 'Churned, reactivated & continuing', scope: 'users',
+      what: 'Who started, came back, stayed or stopped using Collibra, compared with the comparison period.',
+      how: 'People active now are compared by name with people active in the comparison period and with Collibra\u2019s New users for the current period.',
+      formula: 'Continuing = active now and in comparison\nNew = active now, first visit ever in this period\nReactivated = active now, not in comparison, not new\nChurned = active in comparison, not now\nChurn rate = Churned ÷ Active in comparison × 100\nRetention rate = Continuing ÷ Active in comparison × 100',
+      source: [`GET ${UA_S}/licenseTypes/timeSeries/download?userType=Active (both periods)`, `GET ${UA_S}/licenseTypes/timeSeries/download?userType=New`],
+      caveats: ['Needs "Compare to" set to a comparison period.', C.nameDedup],
+    },
+    'us-cohort': {
+      title: 'Cohort retention', scope: 'users',
+      what: 'Of the people who started in a given bucket, what share were still active 1, 2, 3… buckets later.',
+      how: 'Each active person is assigned to the cohort of their first active bucket in the range. For each cohort and offset k, the share of its members active k buckets later is shown.',
+      formula: 'Retention(cohort, +k) = Members active in bucket (cohort + k) ÷ Cohort size × 100',
+      source: [`GET ${UA_S}/licenseTypes/timeSeries/download?userType=Active&granularity=…`],
+      caveats: ['Approximation: the cohort is the first activity inside the selected range, not a person\u2019s first visit ever. The first cohort therefore includes all existing users.', 'Uses weekly buckets when Day granularity is selected.', C.nameDedup],
+    },
+    'us-personas': {
+      title: 'Usage personas', scope: 'users',
+      what: 'Active people grouped by what they mostly visit: dashboard consumers, catalog explorers, mixed users, and light users.',
+      how: 'Rules on each person\u2019s visit mix in the period: Light = fewer than 5 visits. Otherwise by the share of visits to dashboards: ≥ 80% Dashboard-focused, ≤ 20% Catalog explorer, otherwise Mixed.',
+      formula: 'Dashboard share = Dashboard visits ÷ Total visits',
+      source: [`GET ${UA_S}/licenseTypes/timeSeries/download?userType=Active`],
+      caveats: ['The thresholds are a convention of this dashboard, not a Collibra definition.', C.nameDedup],
+    },
   };
 
   const Info = {
@@ -3108,7 +3697,35 @@ ${built.map((_, i) => `<Relationship Id="rId${i + 1}" Type="http://schemas.openx
     button(label, onClick, cls = 'btn btn-icon info-btn') {
       return h('button', { class: cls, type: 'button', title: `How is \u201c${label}\u201d calculated?`, 'aria-label': `How is ${label} calculated?`, onclick: (e) => { e.stopPropagation(); onClick(); } }, icon('info'));
     },
+
+    /** Plain-text explanation record for exports (same content as the ⓘ dialog). */
+    explain(key, calc, label) {
+      const d = INFO[key] || { title: label || 'This measure', what: 'No description is available for this measure.', scope: 'usage' };
+      const lines = (Array.isArray(calc) ? calc : [calc]).filter(Boolean);
+      return {
+        measure: label || d.title,
+        what: d.what || '',
+        how: d.how || '',
+        formula: d.formula || '',
+        inThisView: lines.join(' | '),
+        scope: this.scopeText(d.scope),
+        source: (d.source || []).join(' | '),
+        caveats: (d.caveats || []).join(' | '),
+      };
+    },
   };
+
+  const EXPLAIN_COLUMNS = [
+    { key: 'widget', label: 'Chart / table' }, { key: 'measure', label: 'Measure' }, { key: 'what', label: 'What it measures' },
+    { key: 'how', label: 'How it\u2019s calculated' }, { key: 'formula', label: 'Formula' }, { key: 'inThisView', label: 'In this view' },
+    { key: 'scope', label: 'Scope' }, { key: 'source', label: 'Data source' }, { key: 'caveats', label: 'Good to know' },
+  ];
+  /** Explanation rows for a widget (one per KPI for KPI strips). */
+  function explainWidget(w) {
+    if (w.kind === 'kpi') return (w.result?.items || []).filter((k) => k.info).map((k) => ({ widget: w.title, ...Info.explain(k.info, k.calc || [], k.label) }));
+    return [{ widget: w.title, ...Info.explain(w.infoKey, w.calc() || [], w.title) }];
+  }
+  const explainDataset = (rows) => ({ columns: EXPLAIN_COLUMNS, rows });
 
   /**
    * A dashboard card. opts: { id, title, sub, span, height, load(w) → result, chartTypes, stackable, view, info? }
@@ -3298,6 +3915,14 @@ ${built.map((_, i) => `<Relationship Id="rId${i + 1}" Type="http://schemas.openx
     return light ? Theme.withLight(make) : make();
   }
 
+  /** "How it's calculated" notes as print-friendly HTML. */
+  function explainHtml(list) {
+    if (!list.length) return '';
+    const row = (label, v) => (v ? `<p><strong>${esc(label)}:</strong> ${esc(v)}</p>` : '');
+    return `<h2 style="font-size:15px;margin:22px 0 6px">How it\u2019s calculated</h2>${list.map((x) => `<div style="margin:0 0 12px">
+      <h3 style="font-size:13px;margin:8px 0 4px">${esc(x.measure)}</h3>${row('What it measures', x.what)}${row('How it\u2019s calculated', x.how)}${row('Formula', x.formula)}${row('In this view', x.inThisView)}${row('Data source', x.source)}${row('Good to know', x.caveats)}</div>`).join('')}`;
+  }
+
   async function exportVisual(w, fmt) {
     try {
       const name = Export.fileName(w.title, fmt === 'jpeg' ? 'jpg' : fmt);
@@ -3320,8 +3945,9 @@ ${built.map((_, i) => `<Relationship Id="rId${i + 1}" Type="http://schemas.openx
         downloadBlob(Export.pdf(pages, w.title), name);
       } else if (fmt === 'print') {
         const header = `<h1>${esc(w.title)}</h1><div class="meta">${esc(State.describe())}</div>`;
-        if (w.result.spec && w.view !== 'table') Export.print(w.title, header + widgetSvg(w, { light: true }).outerHTML);
-        else Export.print(w.title, header + Export.tableHtml(visibleDataset(w)));
+        const notes = explainHtml(explainWidget(w));
+        if (w.result.spec && w.view !== 'table') Export.print(w.title, header + widgetSvg(w, { light: true }).outerHTML + notes);
+        else Export.print(w.title, header + Export.tableHtml(visibleDataset(w)) + notes);
       }
     } catch (e) {
       console.error(e);
@@ -3333,9 +3959,9 @@ ${built.map((_, i) => `<Relationship Id="rId${i + 1}" Type="http://schemas.openx
     const ds = w.dataset();
     if (!ds) return;
     if (fmt === 'csv') downloadBlob(new Blob([Export.csvString(ds)], { type: 'text/csv;charset=utf-8' }), Export.fileName(w.title, 'csv'));
-    else if (fmt === 'xlsx') downloadBlob(Export.xlsx([{ name: w.title, ds }], w.title), Export.fileName(w.title, 'xlsx'));
+    else if (fmt === 'xlsx') downloadBlob(Export.xlsx([{ name: w.title, ds }, { name: 'How calculated', ds: explainDataset(explainWidget(w)), filter: false }], w.title), Export.fileName(w.title, 'xlsx'));
     else if (fmt === 'json') {
-      const out = { meta: Export.meta(w.title), columns: ds.columns.filter((c) => !c.noExport).map((c) => ({ key: c.key, label: c.label, type: c.type || 'text' })), rows: Export.jsonObj(ds) };
+      const out = { meta: Export.meta(w.title), explanation: explainWidget(w), columns: ds.columns.filter((c) => !c.noExport).map((c) => ({ key: c.key, label: c.label, type: c.type || 'text' })), rows: Export.jsonObj(ds) };
       downloadBlob(new Blob([JSON.stringify(out, null, 2)], { type: 'application/json' }), Export.fileName(w.title, 'json'));
     }
   }
@@ -3349,9 +3975,10 @@ ${built.map((_, i) => `<Relationship Id="rId${i + 1}" Type="http://schemas.openx
     if (!ws.length) { toast('Nothing loaded on this tab yet.', 'error'); return; }
     const withData = ws.map((w) => ({ w, ds: w.dataset() })).filter((x) => x.ds);
     const title = `${tabTitle} dashboard`;
+    const explained = explainDataset(withData.flatMap((x) => explainWidget(x.w)));
     try {
       if (fmt === 'xlsx') {
-        downloadBlob(Export.xlsx(withData.map((x) => ({ name: x.w.title, ds: x.ds })), title), Export.fileName(title, 'xlsx'));
+        downloadBlob(Export.xlsx([...withData.map((x) => ({ name: x.w.title, ds: x.ds })), { name: 'How calculated', ds: explained, filter: false }], title), Export.fileName(title, 'xlsx'));
       } else if (fmt === 'csv') {
         const used = new Set();
         const files = withData.map((x) => {
@@ -3360,9 +3987,10 @@ ${built.map((_, i) => `<Relationship Id="rId${i + 1}" Type="http://schemas.openx
           used.add(n);
           return { name: `${n}.csv`, data: Export.csvString(x.ds) };
         });
+        files.push({ name: 'how-calculated.csv', data: Export.csvString(explained) });
         downloadBlob(zipBlob(files), Export.fileName(title, 'zip'));
       } else if (fmt === 'json') {
-        const out = { meta: Export.meta(title), widgets: withData.map((x) => ({ title: x.w.title, columns: x.ds.columns.filter((c) => !c.noExport).map((c) => ({ key: c.key, label: c.label, type: c.type || 'text' })), rows: Export.jsonObj(x.ds) })) };
+        const out = { meta: Export.meta(title), widgets: withData.map((x) => ({ title: x.w.title, explanation: explainWidget(x.w), columns: x.ds.columns.filter((c) => !c.noExport).map((c) => ({ key: c.key, label: c.label, type: c.type || 'text' })), rows: Export.jsonObj(x.ds) })) };
         downloadBlob(new Blob([JSON.stringify(out, null, 2)], { type: 'application/json' }), Export.fileName(title, 'json'));
       } else if (fmt === 'pdf') {
         toast('Building PDF report…');
@@ -3471,6 +4099,15 @@ ${built.map((_, i) => `<Relationship Id="rId${i + 1}" Type="http://schemas.openx
   const maWindow = (g) => ({ Day: 7, Week: 4, Month: 3, Quarter: 2 })[g] || 3;
   const titleCase = (v) => String(v).charAt(0) + String(v).slice(1).toLowerCase();
   const openAsset = (id) => { if (isUuid(id)) App.update({ tab: 'asset', asset: id }); };
+  /** Add an item to the Compare tab selection (and switch to it). */
+  function addToCompare(kind, id, label, { go = true } = {}) {
+    const key = `${kind}:${id}`;
+    if (label) State.labels.set(`item:${id}`, label);
+    const items = State.s.items.includes(key) ? State.s.items : [...State.s.items, key];
+    if (items.length > MAX_COMPARE) { toast(`Compare holds up to ${MAX_COMPARE} items. Remove one first.`, 'error'); return; }
+    App.update({ items, ...(go ? { tab: 'compare' } : {}) });
+    if (!go) toast(`Added ${label || kind} to Compare (${items.length}/${MAX_COMPARE})`, 'good');
+  }
 
   /** Click-to-zoom into a time bucket (sets a custom range). */
   function zoomTo(row) {
@@ -3496,12 +4133,193 @@ ${built.map((_, i) => `<Relationship Id="rId${i + 1}" Type="http://schemas.openx
     return h('label', { class: 'switch', title: 'Show a moving average trend line' }, cb, h('span', { class: 'track' }), 'Moving average');
   }
 
+  function trendToggle(id) {
+    const cb = h('input', { type: 'checkbox', checked: Prefs.get(id, 'trend', false) });
+    cb.addEventListener('change', () => { Prefs.set(id, 'trend', cb.checked); App.rerun(id); });
+    return h('label', { class: 'switch', title: 'Show a linear trend line and growth rate' }, cb, h('span', { class: 'track' }), 'Trend line');
+  }
+  const trendOn = (id) => Prefs.get(id, 'trend', false);
+
+  /** Linear-fit overlay series + calc lines (slope, R², compound growth) for a value series. */
+  function trendInfo(values, g, name = 'Trend', color = Theme.v('--accent') || Theme.palette[4]) {
+    const fit = linearFit(values);
+    const cg = compoundGrowth(values);
+    const gl = g.toLowerCase();
+    if (!fit) return { series: null, calc: ['Trend: needs at least 2 buckets.'] };
+    return {
+      series: { name: `${name} (linear trend)`, values: fit.fitted, color, overlay: true, dashed: true },
+      calc: [
+        `Trend (least-squares line): ${fit.slope >= 0 ? '+' : ''}${fmt1(fit.slope)} per ${gl} on an average of ${fmt1(fit.mean)} (${fit.mean ? `${fit.slope >= 0 ? '+' : ''}${fmt1((fit.slope / fit.mean) * 100)}%` : 'n/a'} of the average per ${gl}); R\u00b2 = ${fit.r2.toFixed(2)}${fit.r2 < 0.3 ? ' (weak fit: the trend explains little of the variation)' : ''}.`,
+        cg ? `Compound growth: (${fmtN(cg.to)} \u00f7 ${fmtN(cg.from)})^(1 \u00f7 ${cg.periods}) \u2212 1 = ${cg.pct >= 0 ? '+' : ''}${fmt1(cg.pct)}% per ${gl}, between the first and last ${gl}s with activity.` : `Compound growth: needs activity in at least two ${gl}s.`,
+      ],
+    };
+  }
+
+  /** Toggle chips (multi-select), e.g. content types in Content mix. */
+  function toggleChips(values, isOn, onToggle, label, colorOf) {
+    return h('div', { class: 'toggle-chips', role: 'group', 'aria-label': label },
+      values.map((v, i) => {
+        const b = h('button', { type: 'button', class: 'toggle-chip', 'aria-pressed': String(isOn(v)), title: isOn(v) ? `Hide ${v}` : `Show ${v}`, onclick: () => onToggle(v) },
+          h('span', { class: 'dot', 'aria-hidden': 'true' }), v);
+        if (colorOf) b.style.setProperty('--chip-color', colorOf(v, i));
+        return b;
+      }));
+  }
+
+  /**
+   * Multi-select list picker anchored to a button. opts: { title, load() → [{id,label,meta}],
+   * selected: [], max?, onApply(ids), search? (q) → Promise<[{id,label,meta}]> for remote search }.
+   */
+  function openListPicker(btn, opts) {
+    if (Menus.open && Menus.open.btn === btn) { Menus.close(); return; }
+    const selected = new Set(opts.selected || []);
+    const max = opts.max || Infinity;
+    let list = null, remote = [], seq = 0;
+    const known = new Map();
+    const search = h('input', { type: 'search', placeholder: opts.placeholder || `Search ${opts.title.toLowerCase()}\u2026`, 'aria-label': `Search ${opts.title}` });
+    const listEl = h('div', { class: 'picker-list' });
+    const countEl = h('span', null);
+    const setCount = () => { countEl.textContent = `${selected.size}${Number.isFinite(max) ? ` of ${max}` : ''} selected`; };
+    const shown = () => {
+      const q = search.value.trim().toLowerCase();
+      const local = (list || []).filter((x) => !q || x.label.toLowerCase().includes(q) || String(x.meta || '').toLowerCase().includes(q));
+      const ids = new Set(local.map((x) => x.id));
+      const sel = [...selected].filter((id) => !ids.has(id)).map((id) => known.get(id) || { id, label: opts.labelOf ? opts.labelOf(id) : id });
+      return [...sel, ...local, ...remote.filter((x) => !ids.has(x.id) && !selected.has(x.id))];
+    };
+    const draw = () => {
+      if (!list) { listEl.replaceChildren(h('div', { class: 'menu-empty' }, h('span', { class: 'spinner sm' }), ' Loading\u2026')); return; }
+      const items = shown();
+      items.forEach((x) => known.set(x.id, x));
+      if (!items.length) { listEl.replaceChildren(h('div', { class: 'menu-empty' }, search.value ? 'No matches' : opts.emptyText || 'Nothing to pick in this date range')); return; }
+      listEl.replaceChildren(...items.slice(0, 500).map((x) => {
+        const cb = h('input', { type: 'checkbox', checked: selected.has(x.id), disabled: !selected.has(x.id) && selected.size >= max });
+        cb.addEventListener('change', () => {
+          if (cb.checked) { if (selected.size >= max) { cb.checked = false; toast(`You can pick up to ${max}.`); return; } selected.add(x.id); } else selected.delete(x.id);
+          setCount();
+          listEl.querySelectorAll('input[type=checkbox]').forEach((i) => { i.disabled = !i.checked && selected.size >= max; });
+        });
+        return h('label', { class: 'picker-item' }, cb, h('span', null, x.label), x.meta ? h('span', { class: 'tag' }, x.meta) : null);
+      }));
+    };
+    const doRemote = debounce(async () => {
+      const q = search.value.trim();
+      const my = ++seq;
+      if (!opts.search || q.length < 2) { remote = []; draw(); return; }
+      try { const r = await opts.search(q); if (my === seq) { remote = r; draw(); } } catch (e) { if (!isAbort(e)) { remote = []; draw(); } }
+    }, 250);
+    search.addEventListener('input', () => { draw(); doRemote(); });
+    const apply = () => { Menus.close(); opts.onApply([...selected], known); };
+    search.addEventListener('keydown', (e) => { if (e.key === 'Enter') apply(); });
+    const menu = h('div', { class: 'menu picker', role: 'dialog', 'aria-label': opts.title, dataset: { temp: '1' } },
+      h('div', { class: 'picker-head' }, search, h('div', { class: 'picker-tools' }, countEl,
+        h('span', null, h('button', { type: 'button', onclick: () => { selected.clear(); setCount(); draw(); } }, 'Clear')))),
+      listEl,
+      h('div', { class: 'picker-foot' },
+        opts.footNote ? h('span', { class: 'note', style: { marginRight: 'auto', padding: 0 } }, opts.footNote) : null,
+        h('button', { class: 'btn btn-sm', type: 'button', onclick: () => Menus.close() }, 'Cancel'),
+        h('button', { class: 'btn btn-primary btn-sm', type: 'button', onclick: apply }, 'Apply')));
+    Menus.close();
+    btn.parentElement.append(menu);
+    btn.setAttribute('aria-expanded', 'true');
+    Menus.open = { btn, menu };
+    setCount();
+    draw();
+    Promise.resolve(opts.load()).then((l) => { list = l || []; list.forEach((x) => known.set(x.id, x)); draw(); }, (e) => { if (!isAbort(e)) { list = []; draw(); } });
+    setTimeout(() => search.focus(), 0);
+  }
+
+  /** Button that opens a list picker; shows the selection count. */
+  function pickerButton(label, count, onOpen) {
+    const btn = h('button', { class: `btn btn-sm filter-btn${count ? ' active' : ''}`, type: 'button', 'aria-haspopup': 'dialog', 'aria-expanded': 'false' },
+      h('span', null, label), h('span', { class: 'count', hidden: !count }, String(count)),
+      s('svg', { class: 'caret', viewBox: '0 0 24 24', 'aria-hidden': 'true' }, s('path', { d: 'M7 10l5 5 5-5z', fill: 'currentColor' })));
+    btn.addEventListener('click', () => onOpen(btn));
+    return h('div', { class: 'menu-wrap' }, btn);
+  }
+
+  /** Small selection chip with a remove button. */
+  function selChip(text, onRemove, meta) {
+    return h('span', { class: 'chip' }, meta ? h('b', null, meta) : null, text,
+      h('button', { type: 'button', 'aria-label': `Remove ${text}`, onclick: onRemove }, '\u2715'));
+  }
+
+  /** Values re-expressed for comparison: absolute, indexed (first non-zero = 100) or % of the series total. */
+  function normalize(values, mode) {
+    if (mode === 'index') {
+      const base = values.find((v) => v > 0);
+      return values.map((v) => (base ? (v / base) * 100 : null));
+    }
+    if (mode === 'pct') {
+      const t = sum(values);
+      return values.map((v) => (t ? (v / t) * 100 : 0));
+    }
+    return values;
+  }
+
+  const cumulative = (values) => { let a = 0; return values.map((v) => (a += v || 0)); };
+
   /** "Comparison: 3 → change +33.3%" line for info dialogs (null when not comparing). */
   function cmpCalc(cur, prev, fmt = fmtN) {
     const cr = State.compareRange();
     if (!cr || prev == null) return null;
     const d = pctChange(cur, prev);
     return `Comparison (${State.compareLabel()}, ${fmtRange(cr.startDate, cr.endDate)}): ${fmt(prev)}. Change = (${fmt(cur)} \u2212 ${fmt(prev)}) \u00f7 ${fmt(prev)} = ${d == null ? 'n/a (comparison is 0)' : `${d > 0 ? '+' : ''}${fmt1(d)}%`}.`;
+  }
+
+  /** Visits over time for one content kind: bars = visits, line (right axis) = distinct items visited per bucket. */
+  function kindTrendCard(tab, id, kind, r, cr, g, span = 6) {
+    const gl = g.toLowerCase();
+    const nouns = pluralWord(kind.toLowerCase());
+    return card(tab, {
+      id, title: `${pluralWord(kind)} over time`, sub: `Bars: ${kind.toLowerCase()} visits per ${gl} \u00b7 line (right axis): distinct ${nouns} visited`, span, height: 260, chartTypes: ['bar', 'line', 'area'],
+      load: async () => {
+        const [cur, prev, items] = await Promise.all([Data.contentTrend(r, g), cr ? Data.contentTrend(cr, g) : null, Data.itemSeries(kind, r, g).catch(soft)]);
+        const visits = cur.rows.map((x) => x[kind]);
+        const total = sum(visits);
+        const prevTotal = prev ? sum(prev.rows, (x) => x[kind]) : null;
+        const distinctAll = items ? items.items.length : null;
+        const series = [{ name: `${kind} visits`, values: visits, color: colorFor(kind) }];
+        if (items) series.push({ name: `Distinct ${nouns} visited`, values: items.distinct, color: Theme.palette[5], y2: true });
+        const ov = compareOverlay(cur.rows, prev && prev.rows, kind, `${kind} visits, ${State.compareLabel()}`);
+        if (ov) series.push(ov);
+        const tr = trendOn(id) ? trendInfo(visits, g, `${kind} visits`) : null;
+        if (tr && tr.series) series.push(tr.series);
+        const delta = prevTotal != null ? pctChange(total, prevTotal) : null;
+        let peak = -1;
+        visits.forEach((v, i) => { if (peak < 0 || v > visits[peak]) peak = i; });
+        const calc = [
+          `${fmtN(total)} ${kind.toLowerCase()} visits over ${plural(cur.rows.length, `${gl} bucket`)} = ${fmt1(cur.rows.length ? total / cur.rows.length : 0)} per ${gl} on average.`,
+          distinctAll != null ? `${plural(distinctAll, `distinct ${kind.toLowerCase()}`)} received at least one visit in the whole range. Per-${gl} distinct counts are on the right axis; adding them up counts an item once per ${gl} it was visited.` : 'Distinct counts aren\u2019t available (the row-level download failed).',
+          peak >= 0 && visits[peak] ? `Busiest ${gl}: ${cur.rows[peak].full} with ${fmtN(visits[peak])} visits${items ? ` to ${plural(items.distinct[peak], kind.toLowerCase())}` : ''}.` : null,
+          cmpCalc(total, prevTotal),
+          ...(tr ? tr.calc : []),
+        ];
+        if (!total) return { empty: { title: `No ${kind.toLowerCase()} visits`, text: `No ${nouns} were visited in this period with the current filters.` }, calc };
+        return {
+          stats: [
+            { label: `${kind} visits`, value: total, primary: true },
+            { label: `Distinct ${nouns}`, value: distinctAll, display: distinctAll == null ? '\u2013' : fmtN(distinctAll), hint: 'Visited at least once in the range' },
+            { label: `Visits per ${kind.toLowerCase()}`, value: distinctAll ? total / distinctAll : null, display: distinctAll ? fmt1(total / distinctAll) : '\u2013', hint: `${kind} visits \u00f7 distinct ${nouns} visited` },
+            { label: `vs ${State.compareLabel()}`, value: delta, display: delta == null ? '\u2013' : `${delta > 0 ? '+' : ''}${fmt1(delta)}%`, hint: prevTotal != null ? `Comparison: ${fmtN(prevTotal)} visits` : 'No comparison' },
+          ],
+          spec: { kind: 'series', mode: 'bar', title: `${pluralWord(kind)} over time`, height: 260, legend: 'always', categories: catsOf(cur.rows), series, onClick: (i) => zoomTo(cur.rows[i]) },
+          dataset: {
+            columns: [
+              { key: 'period', label: 'Period' }, { key: 'start', label: 'Start', type: 'date' }, { key: 'end', label: 'End', type: 'date' },
+              { key: 'visits', label: `${kind} visits`, type: 'number' }, { key: 'distinct', label: `Distinct ${nouns} visited`, type: 'number' },
+              { key: 'prev', label: `${kind} visits, ${State.compareLabel()}`, type: 'number', hidden: !prev },
+            ],
+            rows: cur.rows.map((x, i) => ({ period: x.label, start: x.startDate, end: x.endDate, visits: x[kind], distinct: items ? items.distinct[i] : null, prev: prev && prev.rows[i] ? prev.rows[i][kind] : null })),
+          },
+          extraOptions: () => [trendToggle(id),
+            kind === 'Dashboard'
+              ? h('button', { class: 'btn btn-ghost btn-xs', type: 'button', onclick: () => App.update({ tab: 'dashboards' }) }, 'Dashboard details \u2192')
+              : h('button', { class: 'btn btn-ghost btn-xs', type: 'button', onclick: () => App.update({ tab: 'content', ctype: kind }) }, `${pluralWord(kind)} in Content \u2192`)],
+          calc,
+        };
+      },
+    });
   }
 
   /** Deduplicated active users: headline distinct count, user-days, and a cumulative-unique line. */
@@ -3520,6 +4338,7 @@ ${built.map((_, i) => `<Relationship Id="rId${i + 1}" Type="http://schemas.openx
           `Active days: ${fmtN(u.activeDays)} of ${fmtN(u.days)} days had at least one active user.`,
           u.unique ? `On average each person was active on ${fmt1(u.userDays / u.unique)} of those days.` : null,
           g !== 'Day' ? `The ${gl}ly bars add up to ${fmtN(u.userBuckets)} user-${gl}s; the running-total line ends at ${people(last)}.` : `The running-total line ends at ${people(last)}.`,
+          u.unique ? `Stickiness = avg daily active \u00f7 unique active users = ${fmt1(u.avgDaily)} \u00f7 ${fmtN(u.unique)} = ${fmtPct((u.avgDaily / u.unique) * 100)}. On an average day, that share of this period\u2019s users signed in.` : null,
         ];
         const mismatch = u.downloadDistinct !== u.unique;
         if (mismatch) calc.push(`The row-level download (deduplicated by name) has ${people(u.downloadDistinct)}, while Collibra\u2019s count by user ID is ${fmtN(u.unique)}. The headline uses Collibra\u2019s count; the chart uses the download.`);
@@ -3528,6 +4347,7 @@ ${built.map((_, i) => `<Relationship Id="rId${i + 1}" Type="http://schemas.openx
           { label: 'User-days', value: u.userDays, hint: 'Sum of daily active users: not deduplicated across days' },
           { label: 'Avg daily active', value: u.avgDaily, display: fmt1(u.avgDaily), hint: 'User-days \u00f7 days in range' },
           { label: 'Active days', value: u.activeDays, display: `${fmtN(u.activeDays)} / ${fmtN(u.days)}`, hint: 'Days with at least one active user' },
+          { label: 'Stickiness', value: u.unique ? (u.avgDaily / u.unique) * 100 : null, display: u.unique ? fmtPct((u.avgDaily / u.unique) * 100) : '\u2013', hint: 'Avg daily active \u00f7 unique active users in the range (DAU \u00f7 range uniques)' },
         ];
         if (!u.unique && !u.userDays) return { empty: { title: 'No active users', text: 'Nobody signed in to Collibra in this period with the current filters.' }, calc };
         const series = [
@@ -3604,37 +4424,74 @@ ${built.map((_, i) => `<Relationship Id="rId${i + 1}" Type="http://schemas.openx
       },
     });
 
+    const selTypes = () => UA.TYPES.filter((t) => !State.s.mixOff.includes(t));
+    const toggleMix = (t) => {
+      const off = new Set(State.s.mixOff);
+      if (off.has(t)) off.delete(t);
+      else if (UA.TYPES.length - off.size <= 1) { toast('Keep at least one content type selected.'); return; }
+      else off.add(t);
+      App.update({ mixOff: UA.TYPES.filter((x) => off.has(x)) });
+    };
+    const mixNote = (types) => (types.length < UA.TYPES.length ? `Included content types: ${types.join(', ')}. Excluded: ${UA.TYPES.filter((t) => !types.includes(t)).join(', ')}.` : 'All five content types are included.');
+
     const trend = card(T, {
-      id: 'ov-trend', title: 'Visits over time', sub: 'By content type · click a period to zoom in', span: 8, height: 320, chartTypes: ['area', 'bar', 'line'], stackable: true,
+      id: 'ov-trend', title: 'Visits over time', sub: 'By content type \u00b7 follows the Content mix selection \u00b7 click a period to zoom in', span: 8, height: 320, chartTypes: ['area', 'bar', 'line'], stackable: true,
       load: async () => {
+        const types = selTypes();
+        const selSum = (x) => sum(types, (t) => x[t]);
         const [cur, prev] = await Promise.all([Data.contentTrend(r, g), cr ? Data.contentTrend(cr, g) : null]);
-        const series = UA.TYPES.map((t, i) => ({ name: t, values: cur.rows.map((x) => x[t]), color: colorFor(t, i) }));
-        const ov = compareOverlay(cur.rows, prev && prev.rows);
-        if (ov) series.push(ov);
-        const peak = cur.rows.reduce((a, x) => (x.total > (a ? a.total : -1) ? x : a), null);
+        const totals = cur.rows.map(selSum);
+        const series = types.map((t) => ({ name: t, values: cur.rows.map((x) => x[t]), color: colorFor(t, UA.TYPES.indexOf(t)) }));
+        if (prev) series.push({ name: `Total, ${State.compareLabel()}`, values: cur.rows.map((_, i) => (prev.rows[i] ? selSum(prev.rows[i]) : null)), color: Theme.v('--text-3'), overlay: true, dashed: true });
+        const tr = trendOn('ov-trend') ? trendInfo(totals, g, 'Total') : null;
+        if (tr && tr.series) series.push(tr.series);
+        let peak = -1;
+        totals.forEach((v, i) => { if (peak < 0 || v > totals[peak]) peak = i; });
         return {
           spec: { kind: 'series', mode: 'area', stacked: true, title: 'Visits over time', height: 320, categories: catsOf(cur.rows), series, onClick: (i) => zoomTo(cur.rows[i]) },
+          extraOptions: () => [trendToggle('ov-trend')],
           calc: [
-            `${plural(cur.rows.length, `${g.toLowerCase()} bucket`)}; ${fmtN(sum(cur.rows, (x) => x.total))} visits in total.`,
-            peak && peak.total ? `Busiest bucket: ${peak.full} with ${fmtN(peak.total)} visits.` : null,
-            prev ? `Comparison total: ${fmtN(sum(prev.rows, (x) => x.total))} visits.` : null,
+            mixNote(types),
+            `${plural(cur.rows.length, `${g.toLowerCase()} bucket`)}; ${fmtN(sum(totals))} visits in total.`,
+            peak >= 0 && totals[peak] ? `Busiest bucket: ${cur.rows[peak].full} with ${fmtN(totals[peak])} visits.` : null,
+            prev ? `Comparison total: ${fmtN(sum(prev.rows, selSum))} visits.` : null,
+            ...(tr ? tr.calc : []),
           ],
         };
       },
     });
 
     const mix = card(T, {
-      id: 'ov-mix', title: 'Content mix', sub: 'Share of visits · click to explore', span: 4, height: 260,
+      id: 'ov-mix', title: 'Content mix', sub: 'Share of visits \u00b7 toggle types below \u00b7 click a slice to explore', span: 4, height: 260,
       load: async () => {
         const c = await Data.contentSummary(r);
-        const items = UA.TYPES.map((t, i) => ({ label: t, value: c[t], color: colorFor(t, i) }));
+        const types = selTypes();
+        const selTotal = sum(types, (t) => c[t]);
+        const items = types.map((t) => ({ label: t, value: c[t], color: colorFor(t, UA.TYPES.indexOf(t)) }));
+        const rows = UA.TYPES.map((t) => ({
+          label: t, included: types.includes(t) ? 'Yes' : 'No', value: c[t],
+          share: types.includes(t) && selTotal ? (c[t] / selTotal) * 100 : null,
+          shareAll: c.total ? (c[t] / c.total) * 100 : 0,
+        }));
         return {
-          spec: { kind: 'donut', title: 'Content mix', items, centerLabel: 'visits', valueLabel: 'Visits', onClick: (it) => App.update({ tab: 'content', ctype: it.label }) },
-          dataset: { columns: [{ key: 'label', label: 'Content type' }, { key: 'value', label: 'Visits', type: 'number' }, { key: 'share', label: 'Share %', type: 'pct' }], rows: items.map((x) => ({ ...x, share: c.total ? (x.value / c.total) * 100 : 0 })) },
-          calc: items.map((x) => `${x.label}: ${fmtN(x.value)} \u00f7 ${fmtN(c.total)} = ${fmtPct(c.total ? (x.value / c.total) * 100 : 0)}`),
+          spec: { kind: 'donut', title: 'Content mix', items, centerLabel: types.length < UA.TYPES.length ? 'selected visits' : 'visits', valueLabel: 'Visits', onClick: (it) => App.update({ tab: 'content', ctype: it.label }) },
+          dataset: {
+            columns: [{ key: 'label', label: 'Content type' }, { key: 'included', label: 'Included' }, { key: 'value', label: 'Visits', type: 'number' },
+              { key: 'share', label: 'Share of selected %', type: 'pct' }, { key: 'shareAll', label: 'Share of all visits %', type: 'pct' }],
+            rows,
+          },
+          extraOptions: () => [toggleChips(UA.TYPES, (t) => !State.s.mixOff.includes(t), toggleMix, 'Content types in the mix', (t, i) => colorFor(t, i))],
+          calc: [
+            mixNote(types),
+            ...items.map((x) => `${x.label}: ${fmtN(x.value)} \u00f7 ${fmtN(selTotal)} = ${fmtPct(selTotal ? (x.value / selTotal) * 100 : 0)}`),
+            types.length < UA.TYPES.length ? `The selected types account for ${fmtN(selTotal)} of ${fmtN(c.total)} visits (${fmtPct(c.total ? (selTotal / c.total) * 100 : 0)}).` : null,
+          ],
         };
       },
     });
+
+    const dashTrend = kindTrendCard(T, 'ov-dash-trend', 'Dashboard', r, cr, g);
+    const diagTrend = kindTrendCard(T, 'ov-diag-trend', 'Diagram', r, cr, g);
 
     const topAssets = card(T, {
       id: 'ov-top-assets', title: 'Most visited assets', sub: 'Click to open in Asset Explorer', span: 4,
@@ -3722,7 +4579,7 @@ ${built.map((_, i) => `<Relationship Id="rId${i + 1}" Type="http://schemas.openx
       },
     });
 
-    panel.append(kpis.el, grid(trend, mix), grid(unique, activeUsers), grid(topAssets, topDash, topUsers), grid(communities));
+    panel.append(kpis.el, grid(trend, mix), grid(dashTrend, diagTrend), grid(unique, activeUsers), grid(topAssets, topDash, topUsers), grid(communities));
     runAll(T);
   }
 
@@ -3755,14 +4612,17 @@ ${built.map((_, i) => `<Relationship Id="rId${i + 1}" Type="http://schemas.openx
           const n = maWindow(g);
           series.push({ name: `${n}-${g.toLowerCase()} moving average`, values: movingAverage(cur.rows.map((x) => x[totalKey]), n), color: Theme.v('--warn'), overlay: true });
         }
+        const tr = trendOn('ct-trend') ? trendInfo(cur.rows.map((x) => x[totalKey]), g, type === 'All' ? 'Total' : type) : null;
+        if (tr && tr.series) series.push(tr.series);
         return {
           spec: { kind: 'series', mode: type === 'All' ? 'area' : 'line', stacked: type === 'All', title: 'Visits over time', height: 320, categories: catsOf(cur.rows), series, onClick: (i) => zoomTo(cur.rows[i]) },
-          extraOptions: () => [maToggle('ct-trend')],
+          extraOptions: () => [maToggle('ct-trend'), trendToggle('ct-trend')],
           calc: [
             `Content: ${type === 'All' ? 'all types' : pluralWord(type)}. ${fmtN(sum(cur.rows, (x) => x[totalKey]))} visits over ${plural(cur.rows.length, `${g.toLowerCase()} bucket`)}.`,
             `Average per bucket: ${fmt1(cur.rows.length ? sum(cur.rows, (x) => x[totalKey]) / cur.rows.length : 0)} visits.`,
             prev ? `Comparison period: ${fmtN(sum(prev.rows, (x) => x[totalKey]))} visits.` : null,
             Prefs.get('ct-trend', 'ma', false) ? `Moving average window: ${maWindow(g)} ${g.toLowerCase()}s.` : null,
+            ...(tr ? tr.calc : []),
           ],
         };
       },
@@ -3922,13 +4782,831 @@ ${built.map((_, i) => `<Relationship Id="rId${i + 1}" Type="http://schemas.openx
       },
     });
 
-    panel.append(grid(trend), grid(heat, weekday), grid(tree, byType), grid(moverCard('up'), moverCard('down')), grid(ranked));
+    const conc = concentrationCard(T, 'ct-concentration', {
+      noun: type === 'All' ? 'item' : type.toLowerCase(),
+      loader: async () => (await detail()).map((x) => ({ id: x.id, name: type === 'All' ? `${x.name} (${x.kind})` : x.name, visits: x.visits, link: Env.urlFor(x.kind, x.id) })),
+    });
+
+    const coverage = card(T, {
+      id: 'ct-coverage', title: 'Catalog coverage', sub: 'Share of the catalog visited at least once, by asset type or community', span: 6,
+      load: async () => {
+        if (!['All', 'Asset'].includes(type)) return { empty: { title: 'Assets only', text: 'Coverage is calculated for assets. Choose \u201cAll content\u201d or \u201cAssets\u201d.' } };
+        const by = Prefs.get('ct-coverage', 'by', 'type');
+        const visited = await Data.contentDetail('Asset', r);
+        const groups = new Map();
+        for (const x of visited) {
+          const key = by === 'type' ? x.assetType || '(unknown type)' : x.communityId || '(none)';
+          const e = groups.get(key) || { key, label: by === 'type' ? key : x.community || '(no community)', id: by === 'type' ? null : x.communityId, visited: 0, visits: 0 };
+          e.visited++; e.visits += x.visits;
+          groups.set(key, e);
+        }
+        let totals;
+        if (by === 'type') {
+          const types = await Data.filterList('assetTypes', r).catch(soft) || [];
+          const t = await Data.assetTypeTotals(types.filter((x) => groups.has(x.label)));
+          totals = (e) => t.get(e.label);
+        } else {
+          const top = [...groups.values()].sort((a, b) => b.visits - a.visits).slice(0, 25);
+          const t = await Data.communityTotals(top.map((e) => e.id));
+          totals = (e) => t.get(e.id);
+        }
+        const rows = [...groups.values()].map((e) => { const total = totals(e) ?? null; return { ...e, total, pct: total ? Math.min(100, (e.visited / total) * 100) : null }; })
+          .filter((e) => e.total != null).sort((a, b) => b.total - a.total);
+        const seg = segmented(['type', 'community'], by, (v) => { Prefs.set('ct-coverage', 'by', v); App.rerun('ct-coverage'); }, 'Group by', (v) => (v === 'type' ? 'Asset type' : 'Community'));
+        if (!rows.length) return { empty: { title: 'No totals available', text: 'Catalog totals couldn\u2019t be loaded for the visited groups.' }, extraOptions: () => [seg] };
+        const tv = sum(rows, (x) => x.visited), tt = sum(rows, (x) => x.total);
+        return {
+          stats: [{ label: 'Coverage (shown groups)', value: tt ? (tv / tt) * 100 : null, display: fmtPct(tt ? (tv / tt) * 100 : null, 2), primary: true }, { label: 'Assets visited', value: tv }, { label: 'Assets in these groups', value: tt }],
+          spec: { kind: 'hbar', title: 'Catalog coverage', valueLabel: 'Coverage', valueFormat: (v) => fmtPct(v, v < 1 ? 2 : 1), color: colorFor('Asset'), items: rows.slice(0, 15).map((x) => ({ label: x.label, value: x.pct || 0, sub: `${fmtN(x.visited)} of ${fmtN(x.total)} assets visited \u00b7 ${fmtN(x.visits)} visits` })) },
+          dataset: { columns: [{ key: 'label', label: by === 'type' ? 'Asset type' : 'Community', link: (x) => (x.id ? Env.communityUrl(x.id) : null) }, { key: 'visited', label: 'Assets visited', type: 'number' }, { key: 'total', label: 'Assets in catalog', type: 'number' }, { key: 'pct', label: 'Coverage %', type: 'pct' }, { key: 'visits', label: 'Visits', type: 'number' }], rows },
+          extraOptions: () => [seg],
+          calc: [
+            ...rows.slice(0, 15).map((x) => `${x.label}: ${fmtN(x.visited)} visited \u00f7 ${fmtN(x.total)} in catalog = ${fmtPct(x.pct, 2)}`),
+            by === 'type' ? 'Totals count assets of exactly that type (no subtypes), across the whole catalog.' : 'Totals are taken for the 25 most-visited communities, across the whole catalog.',
+            `Overall for the groups shown: ${fmtN(tv)} \u00f7 ${fmtN(tt)} = ${fmtPct(tt ? (tv / tt) * 100 : null, 2)}.`,
+          ],
+        };
+      },
+    });
+
+    const stale = card(T, {
+      id: 'ct-stale', title: 'Stale but popular', sub: `Top-visited assets not modified in ${State.s.stale}+ days`, span: 12,
+      load: async () => {
+        const seg = segmented([90, 180, 365], State.s.stale, (v) => App.update({ stale: v }), 'Not modified for', (v) => `${v} days`);
+        if (!['All', 'Asset'].includes(type)) return { empty: { title: 'Assets only', text: 'Choose \u201cAll content\u201d or \u201cAssets\u201d.' }, extraOptions: () => [seg] };
+        const top = (await Data.contentDetail('Asset', r)).slice(0, 200);
+        const ctx = await Data.assetContext(top.map((x) => x.id));
+        const now = Date.now();
+        const all = top.map((x, i) => { const c = ctx.get(x.id) || {}; const days = c.modifiedOn ? Math.floor((now - c.modifiedOn) / DAY) : null; return { id: x.id, rank: i + 1, name: x.name, type: c.type || x.assetType, domain: c.domain || x.domain, community: c.community || x.community, visits: x.visits, modified: c.modifiedOn || null, days }; });
+        const rows = all.filter((x) => x.days != null && x.days >= State.s.stale);
+        const known = all.filter((x) => x.days != null).length;
+        return {
+          stats: [{ label: 'Stale assets', value: rows.length, primary: true }, { label: 'Share of top assets', value: known ? (rows.length / known) * 100 : null, display: fmtPct(known ? (rows.length / known) * 100 : null) }, { label: 'Their visits', value: sum(rows, (x) => x.visits) }],
+          dataset: {
+            columns: [{ key: 'rank', label: 'Visit rank', type: 'number' }, { key: 'name', label: 'Asset', link: (x) => Env.assetUrl(x.id) }, { key: 'type', label: 'Asset type' }, { key: 'domain', label: 'Domain', hidden: true }, { key: 'community', label: 'Community' },
+              { key: 'visits', label: 'Visits', type: 'number', bar: true }, { key: 'modified', label: 'Last modified', type: 'datetime', hidden: true }, { key: 'days', label: 'Days since modified', type: 'number' }],
+            rows,
+          },
+          tableOpts: { sort: 'visits', dir: 'desc', onRowClick: (x) => openAsset(x.id), emptyText: `None of the top ${top.length} assets is older than ${State.s.stale} days.` },
+          extraOptions: () => [seg],
+          calc: [
+            `Checked the ${fmtN(top.length)} most-visited assets in the period (${fmtN(known)} with a known modification date).`,
+            `${plural(rows.length, 'asset')} weren\u2019t modified for at least ${State.s.stale} days = ${fmtPct(known ? (rows.length / known) * 100 : null)}; together they got ${fmtN(sum(rows, (x) => x.visits))} visits.`,
+            'Days since modified = today \u2212 the asset\u2019s last-modified date (any change to the asset, its attributes or relations, as recorded by Collibra).',
+          ],
+        };
+      },
+    });
+
+    panel.append(grid(trend), grid(heat, weekday), grid(tree, byType), grid(conc, coverage), grid(moverCard('up'), moverCard('down')), grid(stale), grid(ranked));
     runAll(T);
+  }
+
+  /* ────────────────────────────────────────────────────────────────────────
+     Shared: concentration (Pareto curve + Gini)
+     ──────────────────────────────────────────────────────────────────────── */
+
+  /** loader() → [{ id?, name, visits, link? }] */
+  function concentrationCard(tab, id, { title = 'Concentration of visits', noun, loader, span = 6, info = 'concentration' }) {
+    const nouns = pluralWord(noun);
+    return card(tab, {
+      id, info, title, sub: `How evenly visits spread across ${nouns} \u00b7 the further the curve is above the diagonal, the more concentrated`, span, height: 260,
+      load: async () => {
+        const list = (await loader()).filter((x) => x.visits > 0).sort((a, b) => b.visits - a.visits);
+        const c = concentration(list.map((x) => x.visits));
+        if (!c.n) return { empty: { title: 'No visits', text: `No ${nouns} were visited in this period.` } };
+        let acc = 0;
+        const rows = list.map((x, i) => { acc += x.visits; return { rank: i + 1, name: x.name, id: x.id, link: x.link, visits: x.visits, share: (x.visits / c.total) * 100, cum: (acc / c.total) * 100 }; });
+        return {
+          stats: [
+            { label: 'Gini', value: c.gini, display: c.gini == null ? '\u2013' : c.gini.toFixed(2), primary: true, hint: '0 = visits spread evenly, 1 = all visits on one item' },
+            { label: `Top 10% of ${nouns}`, value: c.top10, display: fmtPct(c.top10), hint: 'Share of visits going to the most-visited 10%' },
+            { label: `Top 20% of ${nouns}`, value: c.top20, display: fmtPct(c.top20), hint: 'Share of visits going to the most-visited 20%' },
+            { label: '80% of visits from', value: c.k80, display: `${fmtN(c.k80)} (${fmtPct(c.k80pct, 0)})`, hint: `${pluralWord(noun)} needed to reach 80% of visits` },
+          ],
+          spec: {
+            kind: 'series', mode: 'area', title, height: 260, integer: false, yFormat: (v) => `${fmtN(v)}%`, valueFormat: (v) => fmtPct(v), legend: 'always',
+            categories: c.curve.map((p) => ({ label: `${p.pct}%`, full: `Top ${p.pct}% of ${nouns} (${fmtN(p.items)})` })),
+            series: [
+              { name: 'Cumulative share of visits', values: c.curve.map((p) => p.share), color: Theme.palette[0] },
+              { name: 'Perfectly even spread', values: c.curve.map((p) => p.pct), color: Theme.v('--text-3'), overlay: true, dashed: true },
+            ],
+          },
+          dataset: {
+            columns: [{ key: 'rank', label: '#', type: 'number' }, { key: 'name', label: titleCase(noun), link: (x) => x.link || null }, { key: 'visits', label: 'Visits', type: 'number', bar: true },
+              { key: 'share', label: 'Share %', type: 'pct' }, { key: 'cum', label: 'Cumulative share %', type: 'pct' }],
+            rows,
+          },
+          calc: [
+            `${plural(c.n, `${noun} with visits`)}, ${fmtN(c.total)} visits in total.`,
+            `Gini = 2 \u00d7 \u03a3(rank \u00d7 visits) \u00f7 (n \u00d7 total) \u2212 (n + 1) \u00f7 n, ranking ascending = ${c.gini == null ? 'n/a' : c.gini.toFixed(3)}.`,
+            `Top 10% = the ${fmtN(Math.max(1, Math.ceil(c.n * 0.1)))} most-visited ${nouns}: ${fmtPct(c.top10)} of visits. Top 20% (${fmtN(Math.max(1, Math.ceil(c.n * 0.2)))}): ${fmtPct(c.top20)}.`,
+            `80% of visits come from ${fmtN(c.k80)} of ${fmtN(c.n)} ${nouns} (${fmtPct(c.k80pct)}).`,
+          ],
+        };
+      },
+    });
+  }
+
+  /* ────────────────────────────────────────────────────────────────────────
+     Tab: Dashboards
+     ──────────────────────────────────────────────────────────────────────── */
+
+  function buildDashboards(panel) {
+    const T = 'dashboards';
+    const r = State.range(), cr = State.compareRange(), g = State.gran();
+    const gl = g.toLowerCase();
+    const { dsel, dmin, dtop } = State.s;
+    const lookback = cr ? { startDate: addDays(cr.startDate, -daysInclusive(cr.startDate, cr.endDate)), endDate: addDays(cr.startDate, -1) } : null;
+    const ignored = FILTERS.filter((f) => !f.services.includes('users') && State.s.f[f.key].length).map((f) => f.label);
+
+    const cur = memo(() => Data.itemSeries('Dashboard', r, g));
+    const prev = memo(() => (cr ? Data.itemSeries('Dashboard', cr, g) : Promise.resolve(null)));
+    const back = memo(() => (lookback ? Data.itemSeries('Dashboard', lookback, 'Quarter').catch(soft) : Promise.resolve(null)));
+    const users = memo(() => Data.userSeries(r, g, 'Active'));
+    const usersPrev = memo(() => (cr ? Data.userSeries(cr, g, 'Active').catch(soft) : Promise.resolve(null)));
+
+    const inSel = (x) => !dsel.length || dsel.includes(x.id);
+    const keep = (x) => inSel(x) && x.total >= dmin;
+    const filterNote = [dsel.length ? `${plural(dsel.length, 'selected dashboard')}` : null, dmin ? `at least ${plural(dmin, 'visit')} in the period` : null].filter(Boolean).join(', ');
+    const filterCalc = filterNote ? `Dashboard filters: ${filterNote}.` : 'All dashboards with visits in the period.';
+    const dashLabel = (id) => State.labels.get(`item:${id}`) || `Dashboard ${id.slice(0, 8)}`;
+    const visitorLabel = `${fmtRange(r.startDate, r.endDate)}`;
+
+    const picker = pickerButton('Dashboards', dsel.length, (btn) => openListPicker(btn, {
+      title: 'Dashboards',
+      selected: dsel,
+      labelOf: dashLabel,
+      footNote: 'Dashboards visited in this or the comparison period',
+      load: async () => {
+        const [c, p] = await Promise.all([cur(), prev().catch(soft)]);
+        const m = new Map();
+        for (const x of [...(p ? p.items : []), ...c.items]) m.set(x.id, { id: x.id, label: x.name, meta: `${fmtN(c.byId.get(x.id)?.total || 0)} visits` });
+        return [...m.values()].sort((a, b) => a.label.localeCompare(b.label));
+      },
+      onApply: (ids, known) => { ids.forEach((id) => { const k = known.get(id); if (k) State.labels.set(`item:${id}`, k.label); }); App.update({ dsel: ids }); },
+    }));
+    panel.append(panelIntro('Dashboards', `${visitorLabel} \u00b7 audience filters apply${ignored.length ? ` \u00b7 dashboards don\u2019t belong to communities or asset types, so the ${ignored.join(' and ')} filters may hide them` : ''}`,
+      picker,
+      selectEl([0, 1, 5, 10, 50, 100], dmin, (v) => App.update({ dmin: Number(v) }), 'Min visits', (v) => (Number(v) ? `\u2265 ${v}` : 'Any')),
+      segmented([5, 10, 20], dtop, (v) => App.update({ dtop: v }), 'Top N in charts', (v) => `Top ${v}`)));
+    if (dsel.length) {
+      panel.append(h('div', { class: 'active-filters sel-chips' }, dsel.map((id) => selChip(dashLabel(id), () => App.update({ dsel: dsel.filter((x) => x !== id) }), 'Dashboard:')),
+        h('button', { class: 'chip-clear', type: 'button', onclick: () => App.update({ dsel: [] }) }, 'Clear')));
+      cur().then((c) => { c.items.forEach((x) => State.labels.set(`item:${x.id}`, x.name)); $$('.sel-chips .chip').forEach((el, i) => { const id = dsel[i]; if (id && c.byId.get(id)) el.childNodes[1].textContent = c.byId.get(id).name; }); }).catch(() => {});
+    }
+
+    const kpis = kpiStrip(T, {
+      id: 'db-kpis', count: 6,
+      load: async () => {
+        const [c, p, s0, s1, us, usp] = await Promise.all([cur(), prev(), Data.contentSummary(r), cr ? Data.contentSummary(cr) : null, users().catch(soft), usersPrev()]);
+        const items = c.items.filter(keep);
+        const pItems = p ? p.items.filter(inSel) : null;
+        const visits = sum(items, (x) => x.total);
+        const pv = pItems ? sum(pItems, (x) => x.total) : null;
+        const n = items.length;
+        const pn = pItems ? pItems.length : null;
+        const avg = n ? visits / n : 0;
+        const pavg = pn ? pv / pn : (pItems ? 0 : null);
+        const share = s0.total ? (visits / s0.total) * 100 : null;
+        const pshare = s1 && s1.total && pv != null ? (pv / s1.total) * 100 : null;
+        const reachOf = (u) => {
+          if (!u || !u.users.length) return null;
+          const viewers = u.users.filter((x) => x.tot.Dashboard > 0);
+          return { viewers, active: u.users.length, pct: (viewers.length / u.users.length) * 100, perViewer: viewers.length ? sum(viewers, (x) => x.tot.Dashboard) / viewers.length : 0 };
+        };
+        const rc = reachOf(us), rp = reachOf(usp);
+        const spark = c.buckets.map((_, i) => sum(items, (x) => x.values[i]));
+        const sel = dsel.length || dmin ? ' Reach uses all dashboards: the user download doesn\u2019t say which dashboard each person opened.' : '';
+        return [
+          { label: 'Dashboard visits', info: 'db-visits', value: visits, prev: pv, delta: pv != null ? pctChange(visits, pv) : null, spark, color: colorFor('Dashboard'),
+            calc: [filterCalc, `${fmtN(visits)} visits = sum of the per-dashboard visit counts in the row-level download.`, cmpCalc(visits, pv)] },
+          { label: 'Dashboards visited', info: 'db-count', value: n, prev: pn, delta: pn != null ? pctChange(n, pn) : null, color: Theme.palette[5], meta: 'distinct, at least 1 visit',
+            calc: [filterCalc, `${plural(n, 'distinct dashboard')} had at least one visit${dmin ? ` (and at least ${fmtN(dmin)})` : ''}.`, cmpCalc(n, pn)] },
+          { label: 'Visits per dashboard', info: 'db-avg', value: avg, display: fmt1(avg), prev: pavg, delta: pavg != null ? pctChange(avg, pavg) : null, color: Theme.palette[3],
+            calc: [n ? `${fmtN(visits)} visits \u00f7 ${plural(n, 'dashboard')} = ${fmt1(avg)}.` : 'No dashboards visited.', cmpCalc(avg, pavg, fmt1)] },
+          { label: 'Share of all visits', info: 'db-share', value: share, display: fmtPct(share), prev: pshare, delta: pshare != null && share != null ? pctChange(share, pshare) : null, ring: share ?? 0, color: Theme.palette[7],
+            calc: [`${fmtN(visits)} dashboard visits \u00f7 ${fmtN(s0.total)} visits to all content \u00d7 100 = ${fmtPct(share)}.`, pshare != null ? `Comparison: ${fmtPct(pshare)}.` : null] },
+          { label: 'Dashboard reach', info: 'db-reach', value: rc ? rc.pct : null, display: rc ? fmtPct(rc.pct) : '\u2013', prev: rp ? rp.pct : null, delta: rc && rp ? pctChange(rc.pct, rp.pct) : null, ring: rc ? rc.pct : 0, color: colorFor('Active'), meta: rc ? `${fmtN(rc.viewers.length)} of ${fmtN(rc.active)} active users` : '',
+            calc: rc ? [`${fmtN(rc.viewers.length)} people opened at least one dashboard \u00f7 ${fmtN(rc.active)} active people \u00d7 100 = ${fmtPct(rc.pct)}.${sel}`, rp ? `Comparison: ${fmtN(rp.viewers.length)} of ${fmtN(rp.active)} = ${fmtPct(rp.pct)}.` : null] : [] },
+          { label: 'Visits per viewer', info: 'db-per-viewer', value: rc ? rc.perViewer : null, display: rc ? fmt1(rc.perViewer) : '\u2013', prev: rp ? rp.perViewer : null, delta: rc && rp ? pctChange(rc.perViewer, rp.perViewer) : null, color: Theme.palette[2], meta: 'dashboard visits per dashboard user',
+            calc: rc && rc.viewers.length ? [`${fmtN(sum(rc.viewers, (x) => x.tot.Dashboard))} dashboard visits \u00f7 ${fmtN(rc.viewers.length)} dashboard viewers = ${fmt1(rc.perViewer)}.${sel}`] : [] },
+        ];
+      },
+    });
+
+    const trend = card(T, {
+      id: 'db-trend', title: 'Dashboard visits over time', sub: `Top ${dtop} dashboards stacked, the rest grouped as \u201cOther\u201d \u00b7 click a period to zoom in`, span: 12, height: 320, chartTypes: ['area', 'bar', 'line'], stackable: true,
+      load: async () => {
+        const [c, p] = await Promise.all([cur(), prev()]);
+        const items = c.items.filter(keep);
+        if (!items.length) return { empty: { title: 'No dashboard visits', text: 'No dashboards match the filters in this period.' }, calc: [filterCalc] };
+        const top = items.slice(0, dtop), rest = items.slice(dtop);
+        const series = top.map((x, i) => ({ name: x.name, values: x.values, color: Theme.palette[i % Theme.palette.length] }));
+        if (rest.length) series.push({ name: `Other (${fmtN(rest.length)})`, values: c.buckets.map((_, i) => sum(rest, (x) => x.values[i])), color: Theme.v('--text-3') });
+        const totals = c.buckets.map((_, i) => sum(items, (x) => x.values[i]));
+        if (p) {
+          const pi = p.items.filter(inSel);
+          series.push({ name: `Total, ${State.compareLabel()}`, values: c.buckets.map((_, i) => (i < p.buckets.length ? sum(pi, (x) => x.values[i]) : null)), color: Theme.v('--text-2'), overlay: true, dashed: true });
+        }
+        if (Prefs.get('db-trend', 'ma', false)) series.push({ name: `${maWindow(g)}-${gl} moving average`, values: movingAverage(totals, maWindow(g)), color: Theme.v('--warn'), overlay: true });
+        const tr = trendOn('db-trend') ? trendInfo(totals, g, 'Total') : null;
+        if (tr && tr.series) series.push(tr.series);
+        return {
+          spec: { kind: 'series', mode: 'area', stacked: true, title: 'Dashboard visits over time', height: 320, categories: catsOf(c.buckets), series, onClick: (i) => zoomTo(c.buckets[i]) },
+          extraOptions: () => [maToggle('db-trend'), trendToggle('db-trend')],
+          calc: [
+            filterCalc,
+            `${fmtN(sum(totals))} visits to ${plural(items.length, 'dashboard')} over ${plural(c.buckets.length, `${gl} bucket`)}; the top ${fmtN(top.length)} account for ${fmtN(sum(top, (x) => x.total))} (${fmtPct(sum(totals) ? (sum(top, (x) => x.total) / sum(totals)) * 100 : 0)}).`,
+            rest.length ? `\u201cOther\u201d adds up the remaining ${plural(rest.length, 'dashboard')}.` : null,
+            ...(tr ? tr.calc : []),
+          ],
+        };
+      },
+    });
+
+    const distinct = card(T, {
+      id: 'db-distinct', title: 'Dashboards visited per period', sub: `Distinct dashboards with at least one visit per ${gl}`, span: 4, height: 240, chartTypes: ['bar', 'line'],
+      load: async () => {
+        const [c, p] = await Promise.all([cur(), prev()]);
+        const items = c.items.filter(keep);
+        const vals = c.buckets.map((_, i) => items.reduce((n, x) => n + (x.values[i] > 0 ? 1 : 0), 0));
+        const series = [{ name: 'Distinct dashboards', values: vals, color: Theme.palette[5] }];
+        if (p) {
+          const pi = p.items.filter(inSel);
+          series.push({ name: `Distinct, ${State.compareLabel()}`, values: c.buckets.map((_, i) => (i < p.buckets.length ? pi.reduce((n, x) => n + (x.values[i] > 0 ? 1 : 0), 0) : null)), color: Theme.v('--text-3'), overlay: true, dashed: true });
+        }
+        return {
+          spec: { kind: 'series', mode: 'bar', title: 'Dashboards visited per period', height: 240, categories: catsOf(c.buckets), series, onClick: (i) => zoomTo(c.buckets[i]) },
+          calc: [filterCalc, `Average ${fmt1(vals.length ? sum(vals) / vals.length : 0)} distinct dashboards per ${gl}; ${plural(items.length, 'distinct dashboard')} across the whole range.`, `Adding the ${gl}s up (${fmtN(sum(vals))}) counts a dashboard once per ${gl} it was visited.`],
+        };
+      },
+    });
+
+    const viewers = card(T, {
+      id: 'db-viewers', title: 'Dashboard viewers over time', sub: `Bars: people who opened a dashboard per ${gl} \u00b7 line: % of that ${gl}\u2019s active users`, span: 4, height: 240, chartTypes: ['bar', 'line'],
+      load: async () => {
+        const u = await users();
+        const vw = u.buckets.map((_, i) => u.users.filter((x) => x.Dashboard[i] > 0).length);
+        const act = u.buckets.map((_, i) => u.users.filter((x) => x.active[i]).length);
+        const pct = vw.map((v, i) => (act[i] ? (v / act[i]) * 100 : 0));
+        return {
+          spec: {
+            kind: 'series', mode: 'bar', title: 'Dashboard viewers over time', height: 240, legend: 'always', categories: catsOf(u.buckets), y2Format: (v) => `${fmtN(v)}%`, y2Integer: false, onClick: (i) => zoomTo(u.buckets[i]),
+            series: [{ name: 'Dashboard viewers', values: vw, color: colorFor('Dashboard') }, { name: 'Reach % of active users', values: pct, color: Theme.palette[1], y2: true, format: (v) => fmtPct(v) }],
+          },
+          dataset: {
+            columns: [{ key: 'period', label: 'Period' }, { key: 'start', label: 'Start', type: 'date' }, { key: 'end', label: 'End', type: 'date' }, { key: 'viewers', label: 'Dashboard viewers', type: 'number' }, { key: 'active', label: 'Active users', type: 'number' }, { key: 'pct', label: 'Reach %', type: 'pct' }],
+            rows: u.buckets.map((b, i) => ({ period: b.label, start: b.startDate, end: b.endDate, viewers: vw[i], active: act[i], pct: pct[i] })),
+          },
+          calc: [`Per ${gl}: people with at least one dashboard visit \u00f7 people active that ${gl} \u00d7 100.`, `Across buckets: ${fmtN(sum(vw))} viewer-${gl}s of ${fmtN(sum(act))} active user-${gl}s.`, 'Counts are of all dashboards (the dashboard picker doesn\u2019t apply).', C.nameDedup],
+        };
+      },
+    });
+
+    const weekday = card(T, {
+      id: 'db-weekday', title: 'Weekday profile', sub: 'Average dashboard visits per weekday', span: 4, height: 240,
+      load: async () => {
+        const daily = await Data.itemSeries('Dashboard', r, 'Day');
+        const items = daily.items.filter(keep);
+        const tot = new Array(7).fill(0), cnt = new Array(7).fill(0);
+        daily.buckets.forEach((b, i) => { const k = weekdayIdx(b.startDate); tot[k] += sum(items, (x) => x.values[i]); cnt[k]++; });
+        const avg = tot.map((v, i) => (cnt[i] ? v / cnt[i] : 0));
+        return {
+          spec: { kind: 'series', mode: 'bar', title: 'Weekday profile', height: 240, integer: false, valueFormat: fmt1, categories: WEEKDAYS.map((d, i) => ({ label: d, full: `${d} (${cnt[i]} days)` })), series: [{ name: 'Average visits', values: avg, color: colorFor('Dashboard') }] },
+          dataset: { columns: [{ key: 'day', label: 'Weekday' }, { key: 'days', label: 'Days in range', type: 'number' }, { key: 'total', label: 'Total visits', type: 'number' }, { key: 'avg', label: 'Average visits', type: 'number' }], rows: WEEKDAYS.map((d, i) => ({ day: d, days: cnt[i], total: tot[i], avg: Math.round(avg[i] * 100) / 100 })) },
+          calc: [filterCalc, ...WEEKDAYS.map((d, i) => `${d}: ${fmtN(tot[i])} visits \u00f7 ${plural(cnt[i], 'day')} = ${fmt1(avg[i])}`)],
+        };
+      },
+    });
+
+    const heat = card(T, {
+      id: 'db-heatmap', title: 'Dashboard \u00d7 period heatmap', sub: `Visits per ${gl} for the top ${dtop} dashboards`, span: 12, height: 260,
+      load: async () => {
+        const c = await cur();
+        const items = c.items.filter(keep).slice(0, dtop);
+        if (!items.length) return { empty: { title: 'No dashboard visits', text: 'No dashboards match the filters in this period.' }, calc: [filterCalc] };
+        const names = items.map((x) => truncate(x.name, 220, 11));
+        return {
+          spec: {
+            kind: 'heatmap', title: 'Dashboard \u00d7 period heatmap', rows: names, cols: c.buckets.map((b) => b.label), values: items.map((x) => x.values), cellH: 22,
+            cellTip: (i, j, v) => `<div class="tt-title">${esc(items[i].name)}</div><div class="tt-sub">${esc(c.buckets[j].full)}</div>${ttRow('', 'Visits', fmtN(v))}`,
+          },
+          dataset: {
+            columns: [{ key: 'name', label: 'Dashboard', link: (x) => Env.dashboardUrl(x.id) }, ...c.buckets.map((b, j) => ({ key: `b${j}`, label: b.label, type: 'number' })), { key: 'total', label: 'Total', type: 'number' }],
+            rows: items.map((x) => ({ id: x.id, name: x.name, total: x.total, ...Object.fromEntries(x.values.map((v, j) => [`b${j}`, v])) })),
+          },
+          calc: [filterCalc, `${plural(items.length, 'dashboard')} \u00d7 ${plural(c.buckets.length, `${gl} bucket`)}. Darker = more visits, relative to the busiest cell (${fmtN(Math.max(...items.flatMap((x) => x.values)))} visits).`],
+        };
+      },
+    });
+
+    const lifecycle = card(T, {
+      id: 'db-lifecycle', title: 'Dashboard lifecycle', sub: cr ? `New, reactivated, continuing and dormant vs ${State.compareLabel()}` : 'Needs a comparison period', span: 6, height: 240,
+      load: async () => {
+        if (!cr) return { empty: { title: 'No comparison period', text: 'Set \u201cCompare to\u201d to see which dashboards are new, continuing or dormant.' } };
+        const [c, p, b] = await Promise.all([cur(), prev(), back()]);
+        const rows = lifecycleRows(c, p, b, inSel);
+        const order = ['New', 'Reactivated', 'Continuing', 'Dormant'];
+        const counts = Object.fromEntries(order.map((k) => [k, rows.filter((x) => x.status === k).length]));
+        const colors = { New: Theme.v('--good'), Reactivated: Theme.palette[5], Continuing: Theme.palette[0], Dormant: Theme.v('--bad') };
+        return {
+          spec: { kind: 'donut', title: 'Dashboard lifecycle', items: order.map((k) => ({ label: k, value: counts[k], color: colors[k] })), centerLabel: 'dashboards', valueLabel: 'Dashboards' },
+          dataset: {
+            columns: [{ key: 'name', label: 'Dashboard', link: (x) => Env.dashboardUrl(x.id) }, { key: 'status', label: 'Status' }, { key: 'cur', label: 'Visits', type: 'number' }, { key: 'prev', label: `Visits, ${State.compareLabel()}`, type: 'number' }, { key: 'back', label: 'Visits, look-back period', type: 'number' }],
+            rows,
+          },
+          tableOpts: { sort: 'cur', dir: 'desc' },
+          calc: [
+            `Comparison: ${fmtRange(cr.startDate, cr.endDate)}. Look-back: ${fmtRange(lookback.startDate, lookback.endDate)}.`,
+            ...order.map((k) => `${k}: ${plural(counts[k], 'dashboard')}.`),
+            b ? null : 'The look-back period couldn\u2019t be loaded, so nothing is classified as Reactivated.',
+            dsel.length ? `Limited to ${plural(dsel.length, 'selected dashboard')}.` : null,
+          ],
+        };
+      },
+    });
+
+    const conc = concentrationCard(T, 'db-concentration', {
+      noun: 'dashboard',
+      loader: async () => (await cur()).items.filter(keep).map((x) => ({ id: x.id, name: x.name, visits: x.total, link: Env.dashboardUrl(x.id) })),
+    });
+
+    const moverCard = (dir) => card(T, {
+      id: `db-movers-${dir}`, info: dir === 'up' ? 'ct-movers-up' : 'ct-movers-down', title: dir === 'up' ? 'Rising dashboards' : 'Falling dashboards', sub: cr ? `Biggest change in visits vs ${State.compareLabel()}` : 'Needs a comparison period', span: 6,
+      load: async () => {
+        if (!cr) return { empty: { title: 'No comparison period', text: 'Set \u201cCompare to\u201d to see rising and falling dashboards.' } };
+        const [c, p] = await Promise.all([cur(), prev()]);
+        const rows = moverRows(c, p, inSel).filter((x) => (dir === 'up' ? x.change > 0 : x.change < 0)).sort((a, b) => (dir === 'up' ? b.change - a.change : a.change - b.change));
+        if (!rows.length) return { empty: { title: dir === 'up' ? 'Nothing rising' : 'Nothing falling', text: `No dashboard has ${dir === 'up' ? 'more' : 'fewer'} visits than in the comparison period.` } };
+        return {
+          spec: { kind: 'hbar', title: dir === 'up' ? 'Rising dashboards' : 'Falling dashboards', valueLabel: 'Change in visits', color: dir === 'up' ? Theme.v('--good') : Theme.v('--bad'), items: rows.slice(0, 10).map((x) => ({ label: x.name, value: Math.abs(x.change), sub: `${fmtN(x.prev)} \u2192 ${fmtN(x.cur)} visits`, onClick: () => window.open(Env.dashboardUrl(x.id), '_blank', 'noopener') })), valueFormat: (v) => `${dir === 'up' ? '+' : '\u2212'}${fmtN(v)}` },
+          dataset: { columns: [{ key: 'name', label: 'Dashboard', link: (x) => Env.dashboardUrl(x.id) }, { key: 'prev', label: 'Before', type: 'number' }, { key: 'cur', label: 'Now', type: 'number' }, { key: 'change', label: 'Change', type: 'number' }, { key: 'pct', label: 'Change %', type: 'delta' }], rows },
+          calc: [`${plural(rows.length, 'dashboard')} ${dir === 'up' ? 'gained' : 'lost'} visits; total change ${fmtN(sum(rows, (x) => x.change))}.`, `Largest: \u201c${rows[0].name}\u201d, ${fmtN(rows[0].prev)} \u2192 ${fmtN(rows[0].cur)}.`],
+        };
+      },
+    });
+
+    const reachLicense = card(T, {
+      id: 'db-reach-license', title: 'Dashboard reach by license type', sub: 'Share of each license type\u2019s active users who opened a dashboard', span: 6,
+      load: async () => {
+        const u = await users();
+        const m = new Map();
+        for (const x of u.users) {
+          const k = x.license || '(unknown)';
+          const e = m.get(k) || { license: k, active: 0, viewers: 0, visits: 0 };
+          e.active++;
+          if (x.tot.Dashboard > 0) { e.viewers++; e.visits += x.tot.Dashboard; }
+          m.set(k, e);
+        }
+        const rows = [...m.values()].map((e) => ({ ...e, pct: e.active ? (e.viewers / e.active) * 100 : 0, perViewer: e.viewers ? e.visits / e.viewers : 0 })).sort((a, b) => b.pct - a.pct);
+        if (!rows.length) return { empty: { title: 'No active users', text: 'Nobody was active in this period.' } };
+        return {
+          spec: { kind: 'hbar', title: 'Dashboard reach by license type', valueLabel: 'Reach', valueFormat: (v) => fmtPct(v), color: colorFor('Dashboard'), items: rows.map((x) => ({ label: x.license, value: x.pct, sub: `${fmtN(x.viewers)} of ${fmtN(x.active)} active users \u00b7 ${fmtN(x.visits)} dashboard visits` })) },
+          dataset: { columns: [{ key: 'license', label: 'License type' }, { key: 'active', label: 'Active users', type: 'number' }, { key: 'viewers', label: 'Dashboard viewers', type: 'number' }, { key: 'pct', label: 'Reach %', type: 'pct' }, { key: 'visits', label: 'Dashboard visits', type: 'number' }, { key: 'perViewer', label: 'Visits per viewer', type: 'number', format: fmt1 }], rows },
+          calc: rows.map((x) => `${x.license}: ${fmtN(x.viewers)} \u00f7 ${fmtN(x.active)} = ${fmtPct(x.pct)}`),
+        };
+      },
+    });
+
+    const consumers = card(T, {
+      id: 'db-consumers', title: 'Top dashboard users', sub: 'People with the most dashboard visits', span: 6,
+      load: async () => {
+        const u = await users();
+        const rows = u.users.filter((x) => x.tot.Dashboard > 0).sort((a, b) => b.tot.Dashboard - a.tot.Dashboard)
+          .map((x, i) => ({ rank: i + 1, name: x.name, license: x.license, dash: x.tot.Dashboard, visits: x.tot.visits, share: x.tot.visits ? (x.tot.Dashboard / x.tot.visits) * 100 : 0, buckets: x.Dashboard.filter((v) => v > 0).length }));
+        if (!rows.length) return { empty: { title: 'No dashboard users', text: 'Nobody opened a dashboard in this period.' } };
+        return {
+          spec: { kind: 'hbar', title: 'Top dashboard users', valueLabel: 'Dashboard visits', color: colorFor('Dashboard'), rowH: 24, items: rows.slice(0, 15).map((x) => ({ label: x.name, value: x.dash, sub: `${fmtPct(x.share, 0)} of their visits \u00b7 ${x.license}`, onClick: () => App.update({ tab: 'users', users: uniq([...State.s.users, x.name]).slice(-MAX_TRACKED_USERS) }) })) },
+          dataset: { columns: [{ key: 'rank', label: '#', type: 'number' }, { key: 'name', label: 'User' }, { key: 'license', label: 'License' }, { key: 'dash', label: 'Dashboard visits', type: 'number', bar: true }, { key: 'visits', label: 'All visits', type: 'number' }, { key: 'share', label: 'Dashboard share %', type: 'pct' }, { key: 'buckets', label: `Active ${gl}s`, type: 'number' }], rows },
+          calc: [`${plural(rows.length, 'person')} opened at least one dashboard; together ${fmtN(sum(rows, (x) => x.dash))} dashboard visits.`, `Dashboard share = a person\u2019s dashboard visits \u00f7 all their visits.`, 'Click a person to track them on Users & Adoption.', C.nameDedup],
+        };
+      },
+    });
+
+    const table = card(T, {
+      id: 'db-table', title: 'All dashboards ranked', sub: 'Every dashboard visited in this or the comparison period', span: 12,
+      load: async () => {
+        const [c, p, b] = await Promise.all([cur(), prev(), back()]);
+        const life = cr ? new Map(lifecycleRows(c, p, b, inSel).map((x) => [x.id, x.status])) : new Map();
+        const prevRank = new Map(p ? p.items.map((x, i) => [x.id, i + 1]) : []);
+        const all = c.items.filter(keep);
+        const total = sum(all, (x) => x.total);
+        const rows = all.map((x, i) => {
+          const pv = p ? p.byId.get(x.id)?.total || 0 : null;
+          const act = x.values.filter((v) => v > 0).length;
+          const fi = x.values.findIndex((v) => v > 0), li = x.values.length - 1 - [...x.values].reverse().findIndex((v) => v > 0);
+          return {
+            id: x.id, rank: i + 1, name: x.name, visits: x.total, prev: pv, delta: pv ? pctChange(x.total, pv) : null, share: total ? (x.total / total) * 100 : 0,
+            prevRank: prevRank.get(x.id) ?? null, rankChange: prevRank.has(x.id) ? prevRank.get(x.id) - (i + 1) : null,
+            active: act, activePct: (act / c.buckets.length) * 100, first: fi >= 0 ? c.buckets[fi].startDate : '', last: fi >= 0 ? c.buckets[li].startDate : '',
+            status: life.get(x.id) || '', series: x.values,
+          };
+        });
+        if (p && !dmin) for (const x of p.items.filter(inSel)) if (!c.byId.has(x.id)) rows.push({ id: x.id, rank: null, name: x.name, visits: 0, prev: x.total, delta: -100, share: 0, prevRank: prevRank.get(x.id), rankChange: null, active: 0, activePct: 0, first: '', last: '', status: life.get(x.id) || 'Dormant', series: c.buckets.map(() => 0) });
+        if (!rows.length) return { empty: { title: 'No dashboards', text: 'No dashboards match the filters in this period.' }, calc: [filterCalc] };
+        return {
+          dataset: {
+            columns: [
+              { key: 'rank', label: '#', type: 'number' },
+              { key: 'name', label: 'Dashboard', link: (x) => Env.dashboardUrl(x.id) },
+              { key: 'visits', label: 'Visits', type: 'number', bar: true },
+              { key: 'prev', label: `Visits, ${State.compareLabel()}`, type: 'number', hidden: !p },
+              { key: 'delta', label: 'Change %', type: 'delta', hidden: !p, isNew: (x) => !x.prev && x.visits > 0 },
+              { key: 'share', label: 'Share %', type: 'pct' },
+              { key: 'rankChange', label: 'Rank change', type: 'number', hidden: !p, format: (v) => (v > 0 ? `\u25b2 ${v}` : v < 0 ? `\u25bc ${-v}` : '\u2022') },
+              { key: 'active', label: `Active ${gl}s`, type: 'number' },
+              { key: 'activePct', label: `Active ${gl}s %`, type: 'pct', hidden: true },
+              { key: 'first', label: `First active ${gl}`, type: 'date', hidden: true },
+              { key: 'last', label: `Last active ${gl}`, type: 'date' },
+              { key: 'status', label: 'Lifecycle', hidden: !cr },
+              { key: 'series', label: `Visits per ${gl}`, value: (x) => x.series.join(' | '), render: (x) => sparkline(x.series, colorFor('Dashboard'), 110, 26) },
+              { key: 'cmp', label: '', noExport: true, value: () => '', render: (x) => h('button', { class: 'btn btn-ghost btn-xs', type: 'button', title: 'Add to Compare', onclick: (e) => { e.stopPropagation(); addToCompare('Dashboard', x.id, x.name, { go: false }); } }, '+ Compare') },
+            ],
+            rows,
+          },
+          tableOpts: { sort: 'visits', dir: 'desc', searchPlaceholder: 'Search dashboards\u2026' },
+          calc: [filterCalc, `${plural(rows.length, 'dashboard')}; ${fmtN(total)} visits. Share % = dashboard visits \u00f7 visits to all listed dashboards.`, p ? 'Rank change = rank in the comparison period \u2212 rank now (\u25b2 = moved up).' : null, `Active ${gl}s = ${gl}s with at least one visit, out of ${fmtN(c.buckets.length)}.`],
+        };
+      },
+    });
+
+    panel.append(kpis.el, grid(trend), grid(distinct, viewers, weekday), grid(heat), grid(lifecycle, conc), grid(moverCard('up'), moverCard('down')), grid(reachLicense, consumers), grid(table));
+    runAll(T);
+  }
+
+  /** Change in visits per item between two itemSeries results. */
+  function moverRows(c, p, inSel = () => true) {
+    const ids = uniq([...c.items.filter(inSel).map((x) => x.id), ...p.items.filter(inSel).map((x) => x.id)]);
+    return ids.map((id) => {
+      const a = c.byId.get(id), b = p.byId.get(id);
+      const cur = a ? a.total : 0, prev = b ? b.total : 0;
+      return { id, name: (a || b).name, cur, prev, change: cur - prev, pct: prev ? ((cur - prev) / prev) * 100 : null };
+    });
+  }
+
+  /** Lifecycle status per item: New / Reactivated / Continuing / Dormant (current vs comparison vs look-back). */
+  function lifecycleRows(c, p, b, inSel = () => true) {
+    return moverRows(c, p, inSel).map((x) => {
+      const bk = b ? b.byId.get(x.id)?.total || 0 : 0;
+      const status = x.cur > 0 && x.prev > 0 ? 'Continuing' : x.cur > 0 ? (bk > 0 ? 'Reactivated' : 'New') : 'Dormant';
+      return { id: x.id, name: x.name, status, cur: x.cur, prev: x.prev, back: b ? bk : null };
+    });
   }
 
   /* ────────────────────────────────────────────────────────────────────────
      Tab: Users & Adoption
      ──────────────────────────────────────────────────────────────────────── */
+
+  const PERSONAS = ['Dashboard-focused', 'Mixed', 'Catalog explorer', 'Light'];
+  /** Usage persona from a person's visit mix in the period. */
+  function personaOf(visits, dashboard) {
+    if (visits < 5) return 'Light';
+    const d = dashboard / visits;
+    if (d >= 0.8) return 'Dashboard-focused';
+    if (d <= 0.2) return 'Catalog explorer';
+    return 'Mixed';
+  }
+  const PERSONA_RULES = 'Light = fewer than 5 visits in the period. Otherwise, by the share of the person\u2019s visits that went to dashboards: Dashboard-focused \u2265 80%, Catalog explorer \u2264 20% (mostly assets, domains, communities, diagrams), Mixed in between.';
+
+  const TRACK_METRICS = { visits: 'All visits', sessions: 'Sessions', perSession: 'Visits per session', Asset: 'Asset visits', Dashboard: 'Dashboard visits', Domain: 'Domain visits', Community: 'Community visits', Diagram: 'Diagram visits' };
+  const RATE_LEVEL = { High: 3, Medium: 2, Low: 1 };
+
+  /** Cards for the users picked in "Track users" (empty list when none). */
+  function trackedUserCards(T, r, g, us) {
+    const names = State.s.users;
+    if (!names.length) return [];
+    const gl = g.toLowerCase();
+    const ids = memo(() => Data.resolveUsers(names, r));
+    const rate = memo(() => Data.rateSeries(r, g).catch(soft));
+    const ret = memo(() => Data.retentionSeries(r, g).catch(soft));
+    const colorOf = (i) => Theme.palette[i % Theme.palette.length];
+    const picked = async () => {
+      const u = await us();
+      return names.map((n, i) => ({ name: n, color: colorOf(i), u: u.byName.get(n) || null }));
+    };
+    const metricOf = (u, m, b) => {
+      if (!u) return 0;
+      if (m === 'perSession') return u.sessions[b] ? u.visits[b] / u.sessions[b] : 0;
+      return u[m][b];
+    };
+    const contributions = memo(async () => {
+      const map = await ids();
+      return Promise.all(names.map(async (n) => {
+        const id = map.get(n);
+        if (!id) return { id: null, edits: null, ratings: null };
+        const [ev, rt] = await Promise.all([
+          Data.activitiesFor({ performedByUserId: id }, r, 5000).catch(soft),
+          Api.get('/rest/2.0/ratings', { userId: id, limit: 1000 }).catch(soft),
+        ]);
+        const ratings = rt ? (rt.results || []).map((x) => ({ date: localIsoOfMs(x.createdOn), stars: (Number(x.rating) || 0) * 5 })).filter((x) => x.date >= r.startDate && x.date <= r.endDate) : null;
+        return { id, edits: ev ? { values: Data.countByBucket(ev.events, r, g), total: ev.events.length, capped: ev.capped } : null, ratings: ratings ? { values: Data.countByBucket(ratings, r, g), total: ratings.length, avg: ratings.length ? sum(ratings, (x) => x.stars) / ratings.length : null } : null };
+      }));
+    });
+    const missingNote = (list) => { const miss = list.filter((p) => !p.u).map((p) => p.name); return miss.length ? `No activity in this period for: ${miss.join(', ')}.` : null; };
+
+    const trend = card(T, {
+      id: 'us-track-trend', title: 'Tracked users over time', sub: `One line per person \u00b7 dashed: median of all people active in each ${gl}`, span: 12, height: 320, chartTypes: ['line', 'bar', 'area'],
+      load: async () => {
+        const [u, list] = await Promise.all([us(), picked()]);
+        const m = Prefs.get('us-track-trend', 'metric', 'visits');
+        const bench = Prefs.get('us-track-trend', 'bench', true);
+        const series = list.map((p) => ({ name: p.name, values: u.buckets.map((_, b) => metricOf(p.u, m, b)), color: p.color }));
+        let med = null;
+        if (bench) {
+          med = u.buckets.map((_, b) => median(u.users.filter((x) => x.active[b]).map((x) => metricOf(x, m, b))));
+          series.push({ name: 'Median active user', values: med, color: Theme.v('--text-3'), overlay: true, dashed: true });
+        }
+        const metricSel = selectEl(Object.keys(TRACK_METRICS), m, (v) => { Prefs.set('us-track-trend', 'metric', v); App.rerun('us-track-trend'); }, 'Metric', (v) => TRACK_METRICS[v]);
+        const cb = h('input', { type: 'checkbox', checked: bench });
+        cb.addEventListener('change', () => { Prefs.set('us-track-trend', 'bench', cb.checked); App.rerun('us-track-trend'); });
+        return {
+          spec: { kind: 'series', mode: 'line', title: `Tracked users: ${TRACK_METRICS[m]}`, height: 320, legend: 'always', integer: m !== 'perSession', valueFormat: m === 'perSession' ? fmt1 : fmtN, categories: catsOf(u.buckets), series, onClick: (i) => zoomTo(u.buckets[i]) },
+          extraOptions: () => [metricSel, h('label', { class: 'switch' }, cb, h('span', { class: 'track' }), 'Peer median')],
+          calc: [
+            `Metric: ${TRACK_METRICS[m]} per ${gl}${m === 'perSession' ? ' (visits \u00f7 sessions in that bucket)' : ''}.`,
+            ...list.map((p) => (p.u ? `${p.name}: ${m === 'perSession' ? fmt1(p.u.tot.sessions ? p.u.tot.visits / p.u.tot.sessions : 0) : fmtN(m === 'sessions' ? p.u.tot.sessions : p.u.tot[m] ?? p.u.tot.visits)} over the period, active in ${fmtN(p.u.tot.activeBuckets)} of ${fmtN(u.buckets.length)} ${gl}s.` : null)),
+            bench ? `Peer median: for each ${gl}, the median value among the ${fmtN(median(u.buckets.map((_, b) => u.users.filter((x) => x.active[b]).length)) || 0)} (median) people active in that ${gl}. People with no activity in a bucket are left out.` : null,
+            missingNote(list), C.nameDedup,
+          ],
+        };
+      },
+    });
+
+    const mix = card(T, {
+      id: 'us-track-mix', title: 'What tracked users visit', sub: `Visits by content type per ${gl}, one chart per person`, span: 12,
+      load: async () => {
+        const [u, list] = await Promise.all([us(), picked()]);
+        const rows = [];
+        list.forEach((p) => { if (p.u) u.buckets.forEach((b, j) => rows.push({ user: p.name, period: b.label, start: b.startDate, end: b.endDate, sessions: p.u.sessions[j], ...Object.fromEntries(UA.TYPES.map((t) => [t, p.u[t][j]])), visits: p.u.visits[j] })); });
+        return {
+          render: (body) => {
+            const gridEl = h('div', { class: 'multiples' });
+            body.append(gridEl);
+            list.forEach((p) => {
+              const host = h('div', { class: 'chart-host' });
+              gridEl.append(h('div', { class: 'multiple' }, h('div', { class: 'multiple-head' }, h('strong', { title: p.name }, p.name), h('span', { class: 'muted' }, p.u ? `${fmtN(p.u.tot.visits)} visits \u00b7 ${personaOf(p.u.tot.visits, p.u.tot.Dashboard)}` : 'no activity')), host));
+              if (p.u) Charts.render(host, { kind: 'series', mode: 'bar', stacked: true, title: p.name, height: 150, legend: false, categories: catsOf(u.buckets), series: UA.TYPES.map((t, i) => ({ name: t, values: p.u[t], color: colorFor(t, i) })) });
+              else host.append(stateEl('empty', 'No activity', 'This person had no recorded visits in the period.'));
+            });
+            body.append(h('div', { class: 'legend-row' }, UA.TYPES.map((t, i) => h('span', { class: 'legend-item' }, h('span', { class: 'dot', style: { background: colorFor(t, i) } }), t))));
+          },
+          dataset: { columns: [{ key: 'user', label: 'User' }, { key: 'period', label: 'Period' }, { key: 'start', label: 'Start', type: 'date' }, { key: 'end', label: 'End', type: 'date' }, { key: 'sessions', label: 'Sessions', type: 'number' }, ...UA.TYPES.map((t) => ({ key: t, label: `${t} visits`, type: 'number' })), { key: 'visits', label: 'Total visits', type: 'number' }], rows },
+          calc: [...list.filter((p) => p.u).map((p) => `${p.name}: ${UA.TYPES.map((t) => `${t} ${fmtN(p.u.tot[t])}`).join(', ')} = ${fmtN(p.u.tot.visits)} visits; persona ${personaOf(p.u.tot.visits, p.u.tot.Dashboard)}.`), PERSONA_RULES, missingNote(list)],
+        };
+      },
+    });
+
+    const rateCard = card(T, {
+      id: 'us-track-rate', title: 'Usage rate & retention by period', sub: 'Darker = higher usage rate (Low / Medium / High) \u00b7 hover for usage days and retention', span: 12, height: 200,
+      load: async () => {
+        const [rs, rt] = await Promise.all([rate(), ret()]);
+        if (!rs) return { empty: { title: 'Not available', text: 'The usage-rate download couldn\u2019t be loaded.' } };
+        const sameGran = rs.gran === g && rt;
+        const values = names.map((n) => rs.buckets.map((_, j) => RATE_LEVEL[rs.users.get(n)?.rate[j]] || 0));
+        const rows = [];
+        names.forEach((n) => rs.buckets.forEach((b, j) => {
+          const x = rs.users.get(n);
+          rows.push({ user: n, period: b.label, start: b.startDate, end: b.endDate, rate: x?.rate[j] || '', days: x ? x.days[j] : 0, retention: sameGran ? rt.users.get(n)?.[j] || '' : '' });
+        }));
+        return {
+          spec: {
+            kind: 'heatmap', title: 'Usage rate & retention by period', rows: names.map((n) => truncate(n, 180, 11)), cols: rs.buckets.map((b) => b.label), values, cellH: 24,
+            cellTip: (i, j) => { const x = rows[i * rs.buckets.length + j]; return `<div class="tt-title">${esc(x.user)}</div><div class="tt-sub">${esc(rs.buckets[j].full)}</div>${ttRow('', 'Usage rate', x.rate || 'Not active')}${ttRow('', 'Usage days', fmtN(x.days))}${x.retention ? ttRow('', 'Retention', x.retention) : ''}`; },
+          },
+          dataset: { columns: [{ key: 'user', label: 'User' }, { key: 'period', label: 'Period' }, { key: 'start', label: 'Start', type: 'date' }, { key: 'end', label: 'End', type: 'date' }, { key: 'rate', label: 'Usage rate' }, { key: 'days', label: 'Usage days', type: 'number' }, { key: 'retention', label: 'Retention' }], rows },
+          note: rs.adjusted ? 'Usage rate isn\u2019t available per day, so weekly buckets are shown (retention is omitted).' : null,
+          calc: [
+            'Usage rate per bucket comes from Collibra: High = active more than 50% of the bucket\u2019s days, Medium = 20\u201350%, Low = less than 20%. Cells: High = darkest, empty = not active.',
+            ...names.map((n) => { const x = rs.users.get(n); return x ? `${n}: ${fmtN(sum(x.days))} usage days; High in ${x.rate.filter((v) => v === 'High').length}, Medium in ${x.rate.filter((v) => v === 'Medium').length}, Low in ${x.rate.filter((v) => v === 'Low').length} ${rs.gran.toLowerCase()}s.` : `${n}: no usage-rate rows.`; }),
+            sameGran ? 'Retention per bucket: Acquired = first visit ever, Retained = also active in the previous bucket, Returning = came back after a gap.' : null,
+            C.nameDedup,
+          ],
+        };
+      },
+    });
+
+    const contribCard = (id, what) => card(T, {
+      id, title: what === 'edits' ? 'Edits by tracked users' : 'Ratings given by tracked users', sub: what === 'edits' ? `Audit-trail changes made per ${gl}` : `Ratings submitted per ${gl}`, span: 6, height: 260, chartTypes: ['bar', 'line'],
+      load: async () => {
+        const [con, list] = await Promise.all([contributions(), picked()]);
+        const { buckets } = Data._buckets(r, g);
+        const series = [];
+        const calc = [];
+        list.forEach((p, i) => {
+          const c = con[i];
+          if (!c.id) { calc.push(`${p.name}: couldn\u2019t match this name to a Collibra user, so ${what} aren\u2019t shown.`); return; }
+          const d = c[what];
+          if (!d) { calc.push(`${p.name}: ${what} couldn\u2019t be loaded.`); return; }
+          series.push({ name: p.name, values: d.values, color: p.color });
+          calc.push(`${p.name}: ${fmtN(d.total)} ${what} in the period${what === 'ratings' && d.avg != null ? `, average ${fmt1(d.avg)} stars` : ''}${d.capped ? ' (capped at 5,000 events)' : ''}.`);
+        });
+        calc.push(what === 'edits' ? 'Edits = audit-trail events performed by the user (any resource), counted by the day they happened.' : 'Ratings = ratings the user submitted, counted by creation date.');
+        if (!series.length) return { empty: { title: 'Not available', text: 'None of the tracked users could be matched to a Collibra account.' }, calc };
+        return { spec: { kind: 'series', mode: 'bar', title: what === 'edits' ? 'Edits by tracked users' : 'Ratings given by tracked users', height: 260, legend: 'always', categories: catsOf(buckets), series, emptyText: `No ${what} in this period`, onClick: (i) => zoomTo(buckets[i]) }, calc };
+      },
+    });
+
+    const table = card(T, {
+      id: 'us-track-table', title: 'Tracked users summary', sub: 'Usage, rank among active users, persona and contributions', span: 12,
+      load: async () => {
+        const [u, list, con, rs, rt] = await Promise.all([us(), picked(), contributions().catch(soft), rate(), ret()]);
+        const allVisits = u.users.map((x) => x.tot.visits);
+        const rows = list.map((p, i) => {
+          const x = p.u;
+          const pos = x ? u.users.indexOf(x) : -1;
+          const rr = rs && rs.users.get(p.name);
+          const latest = rr ? [...rr.rate].reverse().find(Boolean) || '' : '';
+          const cats = rt && rt.users.get(p.name) ? uniq(rt.users.get(p.name).filter(Boolean)).join(', ') : '';
+          const c = con && con[i];
+          return {
+            name: p.name, userId: c?.id || '', license: x?.license || '', roles: x?.roles || [], sessions: x ? x.tot.sessions : 0, visits: x ? x.tot.visits : 0,
+            ...Object.fromEntries(UA.TYPES.map((t) => [t, x ? x.tot[t] : 0])),
+            perSession: x && x.tot.sessions ? x.tot.visits / x.tot.sessions : null, activePct: x ? (x.tot.activeBuckets / u.buckets.length) * 100 : 0,
+            first: x && x.first >= 0 ? u.buckets[x.first].startDate : '', last: x && x.last >= 0 ? u.buckets[x.last].startDate : '',
+            rank: pos >= 0 ? pos + 1 : null, pctl: x ? percentileRank(allVisits, x.tot.visits) : null, persona: x ? personaOf(x.tot.visits, x.tot.Dashboard) : 'Inactive',
+            rate: latest, usageDays: rr ? sum(rr.days) : null, retention: cats,
+            edits: c?.edits ? c.edits.total : null, ratings: c?.ratings ? c.ratings.total : null,
+          };
+        });
+        return {
+          dataset: {
+            columns: [
+              { key: 'name', label: 'User', link: (x) => (isUuid(x.userId) ? Env.userUrl(x.userId) : null) },
+              { key: 'license', label: 'License' },
+              { key: 'roles', label: 'Roles', hidden: true },
+              { key: 'persona', label: 'Persona' },
+              { key: 'sessions', label: 'Sessions', type: 'number' },
+              { key: 'visits', label: 'Visits', type: 'number', bar: true },
+              ...UA.TYPES.map((t) => ({ key: t, label: `${t} visits`, type: 'number', hidden: t === 'Diagram' || t === 'Community' })),
+              { key: 'perSession', label: 'Visits / session', type: 'number', format: fmt1 },
+              { key: 'activePct', label: `Active ${gl}s %`, type: 'pct' },
+              { key: 'first', label: `First active ${gl}`, type: 'date', hidden: true },
+              { key: 'last', label: `Last active ${gl}`, type: 'date' },
+              { key: 'rank', label: 'Rank (visits)', type: 'number', format: (v) => `#${fmtN(v)}`, sortValue: (x) => (x.rank == null ? null : -x.rank) },
+              { key: 'pctl', label: 'Percentile', type: 'number', format: (v) => `${Math.round(v)}th` },
+              { key: 'rate', label: 'Usage rate (latest)' },
+              { key: 'usageDays', label: 'Usage days', type: 'number' },
+              { key: 'retention', label: 'Retention', hidden: true },
+              { key: 'edits', label: 'Edits', type: 'number' },
+              { key: 'ratings', label: 'Ratings given', type: 'number' },
+            ],
+            rows,
+          },
+          tableOpts: { search: false, sort: 'visits', dir: 'desc' },
+          calc: [
+            `Rank and percentile compare each tracked person with all ${fmtN(u.users.length)} active people by total visits (percentile = % with fewer visits, ties count half).`,
+            `Active ${gl}s % = ${gl}s with at least one session \u00f7 ${fmtN(u.buckets.length)} ${gl}s in the range.`,
+            PERSONA_RULES,
+            'Edits and ratings need the person\u2019s Collibra user ID, which is looked up by display name.',
+            C.nameDedup,
+          ],
+        };
+      },
+    });
+
+    return [grid(trend), grid(mix), grid(rateCard), grid(contribCard('us-track-edits', 'edits'), contribCard('us-track-ratings', 'ratings')), grid(table)];
+  }
+
+  /** Stickiness, seat utilization, churn, cohort retention and personas. */
+  function populationCards(T, r, cr, g, detail) {
+    const months = makeBuckets(r.startDate, r.endDate, 'Month').map((b) => ({ ...b, label: bucketLabel(b, 'Month'), full: bucketFull(b, 'Month') }));
+
+    const stickiness = card(T, {
+      id: 'us-stickiness', title: 'Stickiness (DAU/MAU)', sub: 'How many of a month\u2019s users come back on a typical day or week', span: 6, height: 260, chartTypes: ['line', 'bar'],
+      load: async () => {
+        const [d, w, m] = await Promise.all([Data.userTrend('license', r, 'Day'), Data.userTrend('license', r, 'Week'), Data.userTrend('license', r, 'Month')]);
+        const rows = months.map((mb) => {
+          const days = d.rows.filter((x) => x.startDate >= mb.startDate && x.startDate <= mb.endDate);
+          const weeks = w.rows.filter((x) => x.bucketStartDate >= mb.bucketStartDate && x.bucketStartDate <= mb.bucketEndDate);
+          const mau = m.rows.find((x) => x.bucketStartDate === mb.bucketStartDate)?.total || 0;
+          const dau = days.length ? sum(days, (x) => x.total) / days.length : 0;
+          const wau = weeks.length ? sum(weeks, (x) => x.total) / weeks.length : 0;
+          return { ...mb, mau, dau, wau, dauMau: mau ? (dau / mau) * 100 : null, wauMau: mau ? (wau / mau) * 100 : null, days: days.length };
+        });
+        const valid = rows.filter((x) => x.mau);
+        if (!valid.length) return { empty: { title: 'No active users', text: 'Nobody signed in during this period.' } };
+        const avg = (k) => sum(valid, (x) => x[k]) / valid.length;
+        return {
+          stats: [
+            { label: 'DAU/MAU', value: avg('dauMau'), display: fmtPct(avg('dauMau')), primary: true, hint: 'Average daily active users \u00f7 monthly active users, averaged over months' },
+            { label: 'WAU/MAU', value: avg('wauMau'), display: fmtPct(avg('wauMau')), hint: 'Average weekly active users \u00f7 monthly active users' },
+            { label: 'Avg DAU', value: avg('dau'), display: fmt1(avg('dau')) },
+            { label: 'Avg MAU', value: avg('mau'), display: fmt1(avg('mau')) },
+          ],
+          spec: {
+            kind: 'series', mode: 'line', title: 'Stickiness (DAU/MAU)', height: 260, legend: 'always', integer: false, yFormat: (v) => `${fmtN(v)}%`, valueFormat: (v) => fmtPct(v), categories: catsOf(rows),
+            series: [{ name: 'DAU/MAU', values: rows.map((x) => x.dauMau), color: Theme.palette[0] }, { name: 'WAU/MAU', values: rows.map((x) => x.wauMau), color: Theme.palette[5] }],
+          },
+          dataset: {
+            columns: [{ key: 'label', label: 'Month' }, { key: 'startDate', label: 'Start', type: 'date' }, { key: 'endDate', label: 'End', type: 'date' }, { key: 'days', label: 'Days', type: 'number' },
+              { key: 'dau', label: 'Avg daily active', type: 'number', format: fmt1 }, { key: 'wau', label: 'Avg weekly active', type: 'number', format: fmt1 }, { key: 'mau', label: 'Monthly active', type: 'number' },
+              { key: 'dauMau', label: 'DAU/MAU %', type: 'pct' }, { key: 'wauMau', label: 'WAU/MAU %', type: 'pct' }],
+            rows,
+          },
+          note: rows.some((x) => x.startDate !== x.bucketStartDate || x.endDate !== x.bucketEndDate) ? 'Partial months at the edges of the range use only the days inside the range.' : null,
+          calc: [
+            ...valid.map((x) => `${x.label}: DAU ${fmt1(x.dau)} (avg of ${fmtN(x.days)} days) \u00f7 MAU ${fmtN(x.mau)} = ${fmtPct(x.dauMau)}; WAU ${fmt1(x.wau)} \u00f7 ${fmtN(x.mau)} = ${fmtPct(x.wauMau)}.`),
+            `Headline = average over ${plural(valid.length, 'month')} with activity.`,
+          ],
+        };
+      },
+    });
+
+    const seats = card(T, {
+      id: 'us-seats', title: 'License seat utilization', sub: 'Active users \u00f7 all known users, per license type', span: 6,
+      load: async () => {
+        const [act, ina] = await Promise.all([detail(), Data.userDetail(r, 'Inactive')]);
+        const m = new Map();
+        const add = (u, k) => { const l = u.license || '(unknown)'; const e = m.get(l) || { license: l, active: 0, inactive: 0 }; e[k]++; m.set(l, e); };
+        act.forEach((u) => add(u, 'active'));
+        ina.forEach((u) => add(u, 'inactive'));
+        const rows = [...m.values()].map((e) => ({ ...e, total: e.active + e.inactive, pct: e.active + e.inactive ? (e.active / (e.active + e.inactive)) * 100 : 0 })).sort((a, b) => b.total - a.total);
+        if (!rows.length) return { empty: { title: 'No users', text: 'No users match the filters.' } };
+        const ta = sum(rows, (x) => x.active), tt = sum(rows, (x) => x.total);
+        return {
+          stats: [{ label: 'Overall utilization', value: tt ? (ta / tt) * 100 : null, display: fmtPct(tt ? (ta / tt) * 100 : null), primary: true }, { label: 'Unused seats', value: tt - ta, hint: 'Known users with no sign-in in the period' }],
+          spec: { kind: 'hbar', title: 'License seat utilization', valueLabel: 'Utilization', valueFormat: (v) => fmtPct(v), color: colorFor('Active'), items: rows.map((x) => ({ label: x.license, value: x.pct, sub: `${fmtN(x.active)} active of ${fmtN(x.total)} users \u00b7 ${fmtN(x.inactive)} unused` })) },
+          dataset: { columns: [{ key: 'license', label: 'License type' }, { key: 'active', label: 'Active users', type: 'number' }, { key: 'inactive', label: 'Inactive users', type: 'number' }, { key: 'total', label: 'Known users', type: 'number' }, { key: 'pct', label: 'Utilization %', type: 'pct' }], rows },
+          calc: [...rows.map((x) => `${x.license}: ${fmtN(x.active)} \u00f7 (${fmtN(x.active)} + ${fmtN(x.inactive)}) = ${fmtPct(x.pct)}`), `Overall: ${fmtN(ta)} \u00f7 ${fmtN(tt)} = ${fmtPct(tt ? (ta / tt) * 100 : null)}.`, C.nameDedup],
+        };
+      },
+    });
+
+    const churn = card(T, {
+      id: 'us-churn', title: 'Churned, reactivated & continuing', sub: cr ? `Who came, stayed or left vs ${State.compareLabel()}` : 'Needs a comparison period', span: 6, height: 240,
+      load: async () => {
+        if (!cr) return { empty: { title: 'No comparison period', text: 'Set \u201cCompare to\u201d to see churned and reactivated users.' } };
+        const [now, before, fresh] = await Promise.all([detail(), Data.userDetail(cr, 'Active'), Data.userDetail(r, 'New').catch(soft)]);
+        const nowM = new Map(now.map((u) => [u.name, u])), prevM = new Map(before.map((u) => [u.name, u]));
+        const newSet = new Set((fresh || []).map((u) => u.name));
+        const rows = [];
+        for (const u of now) rows.push({ name: u.name, license: u.license, status: prevM.has(u.name) ? 'Continuing' : newSet.has(u.name) ? 'New' : 'Reactivated', now: u.visits, before: prevM.get(u.name)?.visits || 0 });
+        for (const u of before) if (!nowM.has(u.name)) rows.push({ name: u.name, license: u.license, status: 'Churned', now: 0, before: u.visits });
+        const order = ['New', 'Reactivated', 'Continuing', 'Churned'];
+        const counts = Object.fromEntries(order.map((k) => [k, rows.filter((x) => x.status === k).length]));
+        const colors = { New: Theme.v('--good'), Reactivated: Theme.palette[5], Continuing: Theme.palette[0], Churned: Theme.v('--bad') };
+        const churnRate = before.length ? (counts.Churned / before.length) * 100 : null;
+        return {
+          stats: [{ label: 'Churn rate', value: churnRate, display: fmtPct(churnRate), primary: true, hint: 'Churned \u00f7 active in the comparison period' }, { label: 'Retention rate', value: before.length ? (counts.Continuing / before.length) * 100 : null, display: fmtPct(before.length ? (counts.Continuing / before.length) * 100 : null), hint: 'Continuing \u00f7 active in the comparison period' }],
+          spec: { kind: 'donut', title: 'Churned, reactivated & continuing', items: order.map((k) => ({ label: k, value: counts[k], color: colors[k] })), centerLabel: 'people', valueLabel: 'People' },
+          dataset: { columns: [{ key: 'name', label: 'User' }, { key: 'license', label: 'License' }, { key: 'status', label: 'Status' }, { key: 'now', label: 'Visits now', type: 'number' }, { key: 'before', label: `Visits, ${State.compareLabel()}`, type: 'number' }], rows },
+          tableOpts: { sort: 'status', dir: 'asc' },
+          calc: [
+            `Now: ${fmtN(now.length)} active people; comparison (${fmtRange(cr.startDate, cr.endDate)}): ${fmtN(before.length)}.`,
+            `New: ${fmtN(counts.New)} (first visit ever in this period). Reactivated: ${fmtN(counts.Reactivated)} (active now, not in the comparison period, not new). Continuing: ${fmtN(counts.Continuing)} (active in both). Churned: ${fmtN(counts.Churned)} (active before, not now).`,
+            churnRate != null ? `Churn rate = ${fmtN(counts.Churned)} \u00f7 ${fmtN(before.length)} = ${fmtPct(churnRate)}. Retention rate = ${fmtN(counts.Continuing)} \u00f7 ${fmtN(before.length)} = ${fmtPct((counts.Continuing / before.length) * 100)}.` : null,
+            C.nameDedup,
+          ],
+        };
+      },
+    });
+
+    const cg = g === 'Day' ? 'Week' : g;
+    const cohort = card(T, {
+      id: 'us-cohort', title: 'Cohort retention', sub: `Rows: people grouped by their first active ${cg.toLowerCase()} in the range \u00b7 columns: % still active N ${cg.toLowerCase()}s later`, span: 12, height: 300,
+      load: async () => {
+        const u = await Data.userSeries(r, cg, 'Active');
+        const n = u.buckets.length;
+        if (n < 2) return { empty: { title: 'Range too short', text: `Cohorts need at least two ${cg.toLowerCase()}s. Choose a longer range or a finer granularity.` } };
+        const cohorts = u.buckets.map((b, i) => ({ b, i, members: u.users.filter((x) => x.first === i) })).filter((c) => c.members.length);
+        const values = cohorts.map((c) => Array.from({ length: n }, (_, k) => (c.i + k < n ? (c.members.filter((x) => x.active[c.i + k]).length / c.members.length) * 100 : null)));
+        const rows = cohorts.map((c, ci) => ({ cohort: c.b.label, start: c.b.startDate, size: c.members.length, ...Object.fromEntries(values[ci].map((v, k) => [`k${k}`, v == null ? null : Math.round(v * 10) / 10])) }));
+        return {
+          spec: {
+            kind: 'heatmap', title: 'Cohort retention', rows: cohorts.map((c) => `${c.b.label} (${fmtN(c.members.length)})`), cols: Array.from({ length: n }, (_, k) => `+${k}`), values, cellH: 22,
+            cellTip: (i, k, v) => `<div class="tt-title">${esc(cohorts[i].b.full)} cohort</div>${ttRow('', 'Size', fmtN(cohorts[i].members.length))}${ttRow('', `${cg} +${k}`, v == null ? '\u2013' : fmtPct(v))}${ttRow('', 'Active', v == null ? '\u2013' : fmtN(Math.round((v / 100) * cohorts[i].members.length)))}`,
+          },
+          dataset: { columns: [{ key: 'cohort', label: 'Cohort' }, { key: 'start', label: 'Start', type: 'date' }, { key: 'size', label: 'People', type: 'number' }, ...Array.from({ length: n }, (_, k) => ({ key: `k${k}`, label: `+${k} %`, type: 'pct' }))], rows },
+          note: g === 'Day' ? 'Cohorts use weekly buckets when Day granularity is selected.' : null,
+          calc: [
+            `${plural(cohorts.length, 'cohort')} from ${fmtN(u.users.length)} active people. A person\u2019s cohort is their first active ${cg.toLowerCase()} within the selected range.`,
+            `Cell (+k) = people in the cohort active k ${cg.toLowerCase()}s after their first ${cg.toLowerCase()} \u00f7 cohort size \u00d7 100. Column +0 is always 100%.`,
+            'Approximation: people who were already users before the range start are placed in the cohort of their first activity inside the range, not their true first visit.',
+            C.nameDedup,
+          ],
+        };
+      },
+    });
+
+    const personas = card(T, {
+      id: 'us-personas', title: 'Usage personas', sub: 'People grouped by what they visit', span: 6, height: 240,
+      load: async () => {
+        const users = await detail();
+        const rows = users.map((u) => ({ name: u.name, license: u.license, persona: personaOf(u.visits, u.Dashboard), visits: u.visits, dash: u.Dashboard, share: u.visits ? (u.Dashboard / u.visits) * 100 : 0, sessions: u.sessions }));
+        if (!rows.length) return { empty: { title: 'No active users', text: 'Nobody was active in this period.' } };
+        const counts = Object.fromEntries(PERSONAS.map((p) => [p, rows.filter((x) => x.persona === p).length]));
+        return {
+          spec: { kind: 'donut', title: 'Usage personas', items: PERSONAS.map((p, i) => ({ label: p, value: counts[p], color: [colorFor('Dashboard'), Theme.palette[5], colorFor('Asset'), Theme.v('--text-3')][i] })), centerLabel: 'people', valueLabel: 'People' },
+          dataset: { columns: [{ key: 'name', label: 'User' }, { key: 'license', label: 'License' }, { key: 'persona', label: 'Persona' }, { key: 'visits', label: 'Visits', type: 'number' }, { key: 'dash', label: 'Dashboard visits', type: 'number' }, { key: 'share', label: 'Dashboard share %', type: 'pct' }, { key: 'sessions', label: 'Sessions', type: 'number' }], rows },
+          tableOpts: { sort: 'visits', dir: 'desc' },
+          calc: [PERSONA_RULES, ...PERSONAS.map((p) => `${p}: ${plural(counts[p], 'person')} (${fmtPct((counts[p] / rows.length) * 100)}).`), C.nameDedup],
+        };
+      },
+    });
+
+    return { stickiness, seats, churn, cohort, personas };
+  }
 
   function buildUsers(panel) {
     const T = 'users';
@@ -3937,7 +5615,24 @@ ${built.map((_, i) => `<Relationship Id="rId${i + 1}" Type="http://schemas.openx
     const ignored = FILTERS.filter((f) => !f.services.includes('users') && State.s.f[f.key].length).map((f) => f.label);
 
     panel.append(panelIntro('Users & adoption', `${fmtRange(r.startDate, r.endDate)}${ignored.length ? ` · ${ignored.join(' and ')} filters don\u2019t apply to user metrics` : ''}`,
+      pickerButton('Track users', State.s.users.length, (btn) => openListPicker(btn, {
+        title: 'Users to track',
+        max: MAX_TRACKED_USERS,
+        selected: State.s.users,
+        footNote: `Up to ${MAX_TRACKED_USERS} people active in this period`,
+        load: async () => (await useries()).users.map((u) => ({ id: u.name, label: u.name, meta: `${u.license || 'no license'} \u00b7 ${fmtN(u.tot.visits)} visits` })),
+        onApply: (ids) => App.update({ users: ids }),
+      })),
       segmented(UA.USER_TYPES, pop, (v) => App.update({ utype: v }), 'User population', (v) => `${v} users`)));
+
+    const useries = memo(() => Data.userSeries(r, g, 'Active'));
+    if (State.s.users.length) {
+      panel.append(h('div', { class: 'section-head' }, h('h3', null, 'Tracked users'),
+        h('div', { class: 'active-filters sel-chips' }, State.s.users.map((n) => selChip(n, () => App.update({ users: State.s.users.filter((x) => x !== n) }))),
+          h('button', { class: 'chip-clear', type: 'button', onclick: () => App.update({ users: [] }) }, 'Stop tracking'))));
+      panel.append(...trackedUserCards(T, r, g, useries));
+      panel.append(h('div', { class: 'section-head' }, h('h3', null, 'All users')));
+    }
 
     const detail = memo(() => Data.userDetail(r, 'Active'));
     const rateDetail = memo(() => Data.usageRateDetail(r, g).catch(soft));
@@ -4074,8 +5769,9 @@ ${built.map((_, i) => `<Relationship Id="rId${i + 1}" Type="http://schemas.openx
     });
 
     const unique = uniqueActiveCard(T, 'us-unique', r, g);
+    const pc = populationCards(T, r, cr, g, detail);
 
-    panel.append(kpis.el, grid(unique, funnel), grid(rate, retention), grid(license, top), grid(scatter), grid(table));
+    panel.append(kpis.el, grid(unique, funnel), grid(pc.stickiness, pc.seats), grid(rate, retention), grid(pc.churn, pc.personas), grid(pc.cohort), grid(license, top), grid(scatter), grid(table));
     runAll(T);
   }
 
@@ -4169,6 +5865,7 @@ ${built.map((_, i) => `<Relationship Id="rId${i + 1}" Type="http://schemas.openx
                   a.domain ? h('a', { href: Env.domainUrl(a.domain.id), target: '_blank', rel: 'noopener' }, a.domain.name) : null),
                 a.fullName && a.fullName !== a.name ? h('div', { class: 'note mono' }, a.fullName) : null),
               h('div', { class: 'panel-controls' },
+                h('button', { class: 'btn btn-ghost btn-sm', type: 'button', title: 'Add this asset to the Compare tab', onclick: () => addToCompare('Asset', id) }, '+ Compare'),
                 h('a', { class: 'btn btn-primary btn-sm', href: Env.assetUrl(id), target: '_blank', rel: 'noopener' }, 'Open in Collibra'))));
           },
           dataset: { columns: [{ key: 'k', label: 'Property' }, { key: 'v', label: 'Value' }], rows: [
@@ -4217,12 +5914,15 @@ ${built.map((_, i) => `<Relationship Id="rId${i + 1}" Type="http://schemas.openx
         const ov = compareOverlay(cur.rows, prev && prev.rows, 'count', `Visits, ${State.compareLabel()}`);
         if (ov) series.push(ov);
         if (Prefs.get('as-trend', 'ma', false)) series.push({ name: `${maWindow(g)}-${g.toLowerCase()} moving average`, values: movingAverage(cur.rows.map((x) => x.count), maWindow(g)), color: Theme.v('--warn'), overlay: true });
+        const tr = trendOn('as-trend') ? trendInfo(cur.rows.map((x) => x.count), g, 'Visits') : null;
+        if (tr && tr.series) series.push(tr.series);
         return {
           spec: { kind: 'series', mode: 'area', title: 'Visits over time', height: 300, categories: catsOf(cur.rows), series, emptyText: 'No visits to this asset in this period', onClick: (i) => zoomTo(cur.rows[i]) },
-          extraOptions: () => [maToggle('as-trend')],
+          extraOptions: () => [maToggle('as-trend'), trendToggle('as-trend')],
           calc: [
             `${fmtN(sum(cur.rows, (x) => x.count))} visits over ${plural(cur.rows.length, `${g.toLowerCase()} bucket`)}; ${fmtN(cur.rows.filter((x) => x.count > 0).length)} buckets had at least one visit.`,
             prev ? `Comparison period: ${fmtN(sum(prev.rows, (x) => x.count))} visits.` : null,
+            ...(tr ? tr.calc : []),
           ],
         };
       },
@@ -4276,6 +5976,358 @@ ${built.map((_, i) => `<Relationship Id="rId${i + 1}" Type="http://schemas.openx
 
     panel.append(grid(head), kpis.el, grid(trend, visitors), grid(changes, reviews));
     kpis.el.style.marginTop = 'var(--gap)';
+    runAll(T);
+  }
+
+  /* ────────────────────────────────────────────────────────────────────────
+     Tab: Compare (multiple items over time)
+     ──────────────────────────────────────────────────────────────────────── */
+
+  const orgKind = (meta) => (/domain/i.test(String(meta || '')) ? 'Domain' : 'Community');
+
+  /** Search across assets (REST/GraphQL) and visited dashboards, diagrams, domains and communities. */
+  function compareSearchBox(r, g) {
+    const input = h('input', { type: 'search', placeholder: 'Add an asset, domain, community, dashboard or diagram\u2026', 'aria-label': 'Add an item to compare', id: 'compare-search', autocomplete: 'off', role: 'combobox', 'aria-expanded': 'false', 'aria-controls': 'compare-suggest' });
+    const list = h('div', { class: 'suggest', id: 'compare-suggest', role: 'listbox' });
+    list.hidden = true;
+    let items = [], active = -1, seq = 0;
+    const pick = (it) => { list.hidden = true; input.value = ''; addToCompare(it.kind, it.id, it.name, { go: false }); };
+    const draw = () => {
+      list.replaceChildren(...items.map((it, i) => h('button', { type: 'button', role: 'option', class: i === active ? 'active' : null, 'aria-selected': String(i === active), onmousedown: (e) => { e.preventDefault(); pick(it); } },
+        h('span', { class: 's-name' }, h('span', { class: 'tag tag-brand' }, it.kind), ' ', it.name), h('span', { class: 's-meta' }, it.meta || ''))));
+      if (!items.length) list.replaceChildren(h('div', { class: 'menu-empty' }, 'No matches'));
+      list.hidden = false;
+      input.setAttribute('aria-expanded', 'true');
+    };
+    const local = async (q) => {
+      const ql = q.toLowerCase();
+      const out = [];
+      const kinds = await Promise.all(['Dashboard', 'Diagram', 'Domain', 'Community'].map((k) => Data.itemSeries(k, r, g).catch(() => null)));
+      kinds.forEach((s) => { if (s) s.items.filter((x) => x.name.toLowerCase().includes(ql)).slice(0, 8).forEach((x) => out.push({ kind: s.type, id: x.id, name: x.name, meta: `${fmtN(x.total)} visits in range` })); });
+      for (const o of State.lists.orgs || []) {
+        if (o.label.toLowerCase().includes(ql) && !out.some((x) => x.id === o.id)) out.push({ kind: orgKind(o.meta), id: o.id, name: o.label, meta: o.meta || '' });
+      }
+      return out;
+    };
+    const search = debounce(async () => {
+      const q = input.value.trim();
+      const m = q.match(/^(Asset|Domain|Community|Dashboard|Diagram)?:?\s*([0-9a-f-]{36})$/i);
+      if (m && isUuid(m[2])) { const kind = m[1] ? titleCase(m[1]) : 'Asset'; items = [{ kind, id: m[2], name: m[2], meta: `Add ${kind.toLowerCase()} by ID` }]; active = 0; draw(); return; }
+      if (q.length < 2) { list.hidden = true; return; }
+      const my = ++seq;
+      try {
+        const [assets, others] = await Promise.all([Data.searchAssets(q).catch(() => []), local(q)]);
+        if (my !== seq) return;
+        items = [...others, ...assets.map((a) => ({ kind: 'Asset', id: a.id, name: a.name, meta: [a.type, a.domain, a.community].filter(Boolean).join(' \u00b7 ') }))].slice(0, 25);
+        active = -1;
+        draw();
+      } catch (e) { if (!isAbort(e)) { items = []; draw(); } }
+    }, 250);
+    input.addEventListener('input', search);
+    input.addEventListener('keydown', (e) => {
+      if (list.hidden) return;
+      if (e.key === 'ArrowDown') { active = Math.min(items.length - 1, active + 1); draw(); e.preventDefault(); }
+      else if (e.key === 'ArrowUp') { active = Math.max(0, active - 1); draw(); e.preventDefault(); }
+      else if (e.key === 'Enter' && items[Math.max(0, active)]) { pick(items[Math.max(0, active)]); e.preventDefault(); }
+      else if (e.key === 'Escape') { list.hidden = true; }
+    });
+    input.addEventListener('blur', () => setTimeout(() => { list.hidden = true; input.setAttribute('aria-expanded', 'false'); }, 150));
+    return h('div', { class: 'search-box' }, input, list);
+  }
+
+  function buildCompare(panel) {
+    const T = 'compare';
+    const r = State.range(), cr = State.compareRange(), g = State.gran();
+    const gl = g.toLowerCase();
+    const { items: keys, cmetric, cnorm, cbench } = State.s;
+    const sel = keys.map((k) => { const [kind, id] = k.split(':'); return { key: k, kind, id }; });
+    const METRICS = { visits: 'Visits', cumulative: 'Cumulative visits', share: 'Share of selection %', edits: 'Edits (audit trail)' };
+    const NORMS = { abs: 'Absolute', index: 'Indexed (first = 100)', pct: '% of item total' };
+
+    const quickAdd = (kind, n) => h('button', { class: 'btn btn-ghost btn-sm', type: 'button', onclick: async () => {
+      try {
+        const top = await Data.contentTop(kind, n, r);
+        const add = top.map((x) => { State.labels.set(`item:${x.id}`, x.name); return `${kind}:${x.id}`; }).filter((k) => !State.s.items.includes(k));
+        const items = [...State.s.items, ...add].slice(0, MAX_COMPARE);
+        if (!add.length) toast(`No ${pluralWord(kind.toLowerCase())} to add.`); else App.update({ items });
+      } catch (e) { if (!isAbort(e)) toast(`Couldn\u2019t load top ${pluralWord(kind.toLowerCase())}: ${e.message}`, 'error'); }
+    } }, `+ Top ${n} ${pluralWord(kind.toLowerCase())}`);
+
+    const controls = [
+      selectEl(Object.keys(METRICS), cmetric, (v) => App.update({ cmetric: v }), 'Metric', (v) => METRICS[v]),
+      cmetric === 'share' ? null : segmented(Object.keys(NORMS), cnorm, (v) => App.update({ cnorm: v }), 'Normalize', (v) => NORMS[v]),
+      (() => { const cb = h('input', { type: 'checkbox', checked: cbench }); cb.addEventListener('change', () => App.update({ cbench: cb.checked })); return h('label', { class: 'switch', title: 'Overlay the median of all items of the same kind (visits only)' }, cb, h('span', { class: 'track' }), 'Peer median'); })(),
+    ];
+    panel.append(panelIntro('Compare', `Pick up to ${MAX_COMPARE} items and compare them over time \u00b7 ${fmtRange(r.startDate, r.endDate)}`, ...controls));
+    const nameOf = (it) => State.labels.get(`item:${it.id}`) || State.label('orgs', it.id).replace(/^\u2026$/, '') || `${it.kind} ${it.id.slice(0, 8)}`;
+    const chipsEl = h('div', { class: 'active-filters sel-chips' }, sel.map((it) => selChip(nameOf(it), () => App.update({ items: keys.filter((k) => k !== it.key) }), `${it.kind}:`)),
+      sel.length > 1 ? h('button', { class: 'chip-clear', type: 'button', onclick: () => App.update({ items: [] }) }, 'Clear all') : null);
+    panel.append(h('div', { class: 'compare-bar' }, compareSearchBox(r, g), h('div', { class: 'quick-adds' }, quickAdd('Asset', 5), quickAdd('Dashboard', 5)), h('span', { class: 'muted' }, `${keys.length} / ${MAX_COMPARE}`)), chipsEl);
+
+    if (!sel.length) {
+      panel.append(h('div', { class: 'card span-12 compare-empty' }, stateEl('empty', 'Nothing to compare yet',
+        'Search above, use the quick-add buttons, or click \u201c+ Compare\u201d in Asset Explorer or the Dashboards table. You can mix assets, domains, communities, dashboards and diagrams.')));
+      return;
+    }
+
+    const seriesFor = {}, prevFor = {};
+    const kindSeries = (kind) => (seriesFor[kind] ||= memo(() => Data.itemSeries(kind, r, g)))();
+    const kindPrev = (kind) => (prevFor[kind] ||= memo(() => (cr ? Data.itemSeries(kind, cr, g) : Promise.resolve(null))))();
+    const { buckets } = Data._buckets(r, g);
+
+    const fallbackName = async (it) => {
+      try {
+        if (it.kind === 'Domain') return (await Api.get(`/rest/2.0/domains/${it.id}`)).name;
+        if (it.kind === 'Community') return (await Api.get(`/rest/2.0/communities/${it.id}`)).name;
+        if (it.kind === 'Diagram') return (await Data.assetDetails(it.id)).name;
+      } catch (e) { if (isAbort(e)) throw e; }
+      return null;
+    };
+
+    const resolveItem = async (it, i) => {
+      const color = Theme.palette[i % Theme.palette.length];
+      if (it.kind === 'Asset') {
+        const [t, d, pt] = await Promise.all([Data.assetTrend(it.id, r, g), Data.assetDetails(it.id).catch(soft), cr ? Data.assetTrend(it.id, cr, g).catch(soft) : null]);
+        const name = d?.name || nameOf(it);
+        State.labels.set(`item:${it.id}`, name);
+        return { ...it, color, name, context: [d?.type?.name, d?.domain?.name].filter(Boolean).join(' \u00b7 '), values: t.rows.map((x) => x.count), prevTotal: pt ? sum(pt.rows, (x) => x.count) : null, details: d };
+      }
+      const [s, ps] = await Promise.all([kindSeries(it.kind), kindPrev(it.kind).catch(soft)]);
+      const x = s.byId.get(it.id);
+      const name = x?.name || ps?.byId.get(it.id)?.name || (await fallbackName(it)) || nameOf(it);
+      State.labels.set(`item:${it.id}`, name);
+      return {
+        ...it, color, name, context: x ? [x.assetType, x.kind === 'Domain' ? x.community : x.domain].filter(Boolean).join(' \u00b7 ') : '',
+        values: x ? x.values : buckets.map(() => 0), prevTotal: ps ? ps.byId.get(it.id)?.total || 0 : null,
+      };
+    };
+    const resolved = memo(async () => {
+      const list = await Promise.all(sel.map(resolveItem));
+      chipsEl.querySelectorAll('.chip').forEach((el, i) => { if (list[i]) el.childNodes[1].textContent = list[i].name; });
+      return list;
+    });
+    const editable = (it) => it.kind !== 'Dashboard';
+    const editsFor = memo(async () => {
+      const list = await resolved();
+      return Promise.all(list.map(async (it) => {
+        if (!editable(it)) return null;
+        try {
+          const ev = await Data.activitiesFor({ contextId: it.id }, r, 2000);
+          return { values: Data.countByBucket(ev.events, r, g), total: ev.events.length, capped: ev.capped };
+        } catch (e) { if (isAbort(e)) throw e; return null; }
+      }));
+    });
+
+    /** Per-item values for the selected metric (before normalization). */
+    const metricValues = async () => {
+      const list = await resolved();
+      if (cmetric === 'edits') {
+        const ed = await editsFor();
+        return list.map((it, i) => (ed[i] ? ed[i].values : null));
+      }
+      if (cmetric === 'cumulative') return list.map((it) => cumulative(it.values));
+      if (cmetric === 'share') {
+        const tot = buckets.map((_, b) => sum(list, (it) => it.values[b]));
+        return list.map((it) => it.values.map((v, b) => (tot[b] ? (v / tot[b]) * 100 : 0)));
+      }
+      return list.map((it) => it.values);
+    };
+    const normActive = cmetric !== 'share' && cnorm !== 'abs';
+    const normLabel = cmetric === 'share' ? '' : cnorm === 'index' ? ' (index, first active = 100)' : cnorm === 'pct' ? ' (% of item total)' : '';
+
+    const trend = card(T, {
+      id: 'cp-trend', info: 'cp-trend', title: `${METRICS[cmetric]} over time${normLabel}`, sub: 'One line per item \u00b7 click a period to zoom in', span: 12, height: 340, chartTypes: ['line', 'area', 'bar'],
+      load: async () => {
+        const [list, vals] = await Promise.all([resolved(), metricValues()]);
+        const series = [];
+        const calc = [`Metric: ${METRICS[cmetric]}${normLabel}.`];
+        list.forEach((it, i) => {
+          if (!vals[i]) { calc.push(`${it.name}: not available for ${pluralWord(it.kind.toLowerCase())}.`); return; }
+          const v = normActive ? normalize(vals[i], cnorm) : vals[i];
+          series.push({ name: it.name, values: v, color: it.color });
+          const raw = cmetric === 'edits' ? vals[i] : it.values;
+          calc.push(`${it.name} (${it.kind}): ${fmtN(sum(raw))} ${cmetric === 'edits' ? 'edits' : 'visits'} in the period, ${fmtN(raw.filter((x) => x > 0).length)} of ${fmtN(buckets.length)} ${gl}s active.`);
+          if (trendOn('cp-trend')) { const tr = trendInfo(v, g, it.name, it.color); if (tr.series) series.push(tr.series); calc.push(...tr.calc.map((x) => `${it.name}: ${x}`)); }
+        });
+        if (cbench && ['visits', 'cumulative'].includes(cmetric)) {
+          for (const kind of uniq(list.map((it) => it.kind))) {
+            const s = await kindSeries(kind).catch(soft);
+            if (!s || !s.items.length) continue;
+            let med = buckets.map((_, b) => median(s.items.map((x) => x.values[b])));
+            if (cmetric === 'cumulative') med = cumulative(med);
+            if (normActive) med = normalize(med, cnorm);
+            series.push({ name: `Median ${kind.toLowerCase()} (${fmtN(s.items.length)} visited)`, values: med, color: Theme.v('--text-3'), overlay: true, dashed: true });
+            calc.push(`Peer median for ${pluralWord(kind.toLowerCase())}: per ${gl}, the median visits of the ${fmtN(s.items.length)} ${pluralWord(kind.toLowerCase())} visited at least once in the range (zeros included).`);
+          }
+        } else if (cbench) calc.push('The peer median is only shown for the Visits and Cumulative visits metrics.');
+        if (cnorm === 'index' && normActive) calc.push('Indexed: each value \u00f7 the item\u2019s first non-zero value \u00d7 100, so lines start at 100 and show relative growth.');
+        if (cnorm === 'pct' && normActive) calc.push('% of item total: each value \u00f7 the item\u2019s total over the range \u00d7 100, so lines show when each item was used, regardless of size.');
+        if (cmetric === 'share') calc.push(`Share of selection: an item\u2019s visits in a ${gl} \u00f7 visits to all ${list.length} selected items in that ${gl} \u00d7 100.`);
+        const pct = cmetric === 'share' || cnorm === 'pct';
+        return {
+          spec: { kind: 'series', mode: 'line', title: `${METRICS[cmetric]} over time`, height: 340, legend: 'always', integer: !(pct || cnorm === 'index'), valueFormat: pct ? (v) => fmtPct(v) : fmtN, categories: catsOf(buckets), series, onClick: (i) => zoomTo(buckets[i]) },
+          extraOptions: () => [trendToggle('cp-trend')],
+          calc,
+        };
+      },
+    });
+
+    const multiples = card(T, {
+      id: 'cp-multiples', title: 'Small multiples', sub: `${METRICS[cmetric] === 'Share of selection %' ? 'Visits' : METRICS[cmetric]} per ${gl}, one chart per item, each on its own scale`, span: 12,
+      load: async () => {
+        const [list, vals] = await Promise.all([resolved(), metricValues()]);
+        const useVals = cmetric === 'share' ? list.map((it) => it.values) : vals;
+        const rows = [];
+        list.forEach((it, i) => { if (useVals[i]) buckets.forEach((b, j) => rows.push({ item: it.name, kind: it.kind, period: b.label, start: b.startDate, end: b.endDate, value: useVals[i][j] })); });
+        return {
+          render: (body) => {
+            const gridEl = h('div', { class: 'multiples' });
+            body.append(gridEl);
+            list.forEach((it, i) => {
+              const host = h('div', { class: 'chart-host' });
+              gridEl.append(h('div', { class: 'multiple' }, h('div', { class: 'multiple-head' }, h('span', { class: 'tag' }, it.kind), h('strong', { title: it.name }, it.name), h('span', { class: 'muted' }, useVals[i] ? fmtN(sum(useVals[i])) : 'n/a')), host));
+              if (useVals[i]) Charts.render(host, { kind: 'series', mode: 'area', title: it.name, height: 130, legend: false, categories: catsOf(buckets), series: [{ name: it.name, values: useVals[i], color: it.color }], emptyText: 'No activity' });
+              else host.append(stateEl('empty', 'Not available', `Edits aren\u2019t tracked for ${pluralWord(it.kind.toLowerCase())}.`));
+            });
+          },
+          dataset: { columns: [{ key: 'item', label: 'Item' }, { key: 'kind', label: 'Kind' }, { key: 'period', label: 'Period' }, { key: 'start', label: 'Start', type: 'date' }, { key: 'end', label: 'End', type: 'date' }, { key: 'value', label: cmetric === 'share' ? 'Visits' : METRICS[cmetric], type: 'number' }], rows },
+          calc: [`${plural(list.length, 'item')}, each drawn on its own y-axis so the shape of usage is comparable even when volumes differ. Values are not normalized.`],
+        };
+      },
+    });
+
+    const share = card(T, {
+      id: 'cp-share', title: 'Share of selection over time', sub: `Each item\u2019s % of the selected items\u2019 visits per ${gl}`, span: 6, height: 280, chartTypes: ['bar', 'area'], stackable: true,
+      load: async () => {
+        const list = await resolved();
+        const tot = buckets.map((_, b) => sum(list, (it) => it.values[b]));
+        const series = list.map((it) => ({ name: it.name, values: it.values.map((v, b) => (tot[b] ? (v / tot[b]) * 100 : 0)), color: it.color }));
+        const grand = sum(tot);
+        return {
+          spec: { kind: 'series', mode: 'bar', stacked: true, title: 'Share of selection over time', height: 280, integer: false, yFormat: (v) => `${fmtN(v)}%`, valueFormat: (v) => fmtPct(v), categories: catsOf(buckets), series, emptyText: 'No visits to the selected items' },
+          calc: [`Per ${gl}: item visits \u00f7 visits to all selected items \u00d7 100. ${gl}s with no visits are empty.`, ...list.map((it) => `${it.name}: ${fmtN(sum(it.values))} of ${fmtN(grand)} visits overall = ${fmtPct(grand ? (sum(it.values) / grand) * 100 : 0)}.`)],
+        };
+      },
+    });
+
+    const edits = card(T, {
+      id: 'cp-edits', title: 'Edits vs visits', sub: `Bars: visits to the selected items \u00b7 line (right axis): audit-trail edits, per ${gl}`, span: 6, height: 280, chartTypes: ['bar', 'line'],
+      load: async () => {
+        const [list, ed] = await Promise.all([resolved(), editsFor()]);
+        const withEdits = list.filter((it, i) => ed[i]);
+        const visits = buckets.map((_, b) => sum(withEdits, (it) => it.values[b]));
+        const editVals = buckets.map((_, b) => sum(ed.filter(Boolean), (x) => x.values[b]));
+        const rows = list.map((it, i) => ({ name: it.name, kind: it.kind, visits: sum(it.values), edits: ed[i] ? ed[i].total : null, ratio: ed[i] && sum(it.values) ? ed[i].total / sum(it.values) : null, capped: ed[i]?.capped ? 'Yes' : '' }));
+        if (!withEdits.length) return { empty: { title: 'Not available', text: 'Edits are tracked for assets, domains, communities and diagrams, not dashboards.' } };
+        return {
+          spec: {
+            kind: 'series', mode: 'bar', title: 'Edits vs visits', height: 280, legend: 'always', categories: catsOf(buckets), onClick: (i) => zoomTo(buckets[i]),
+            series: [{ name: 'Visits', values: visits, color: Theme.palette[0] }, { name: 'Edits', values: editVals, color: Theme.v('--warn'), y2: true }],
+          },
+          dataset: { columns: [{ key: 'name', label: 'Item' }, { key: 'kind', label: 'Kind' }, { key: 'visits', label: 'Visits', type: 'number' }, { key: 'edits', label: 'Edits', type: 'number' }, { key: 'ratio', label: 'Edits per visit', type: 'number', format: (v) => v.toFixed(2) }, { key: 'capped', label: 'Edit list capped' }], rows },
+          calc: [
+            ...rows.filter((x) => x.edits != null).map((x) => `${x.name}: ${fmtN(x.edits)} edits \u00f7 ${fmtN(x.visits)} visits = ${x.ratio == null ? (x.edits ? 'edited but never visited' : 'n/a') : x.ratio.toFixed(2)} edits per visit.`),
+            'Edits are audit-trail events in the period whose context is the item (for domains and communities this includes changes to assets inside them).',
+            rows.some((x) => x.capped) ? 'At least one item hit the 2,000-event cap, so its edit count is a minimum.' : null,
+          ],
+        };
+      },
+    });
+
+    const visitors = card(T, {
+      id: 'cp-visitors', title: 'Top visitors per asset', sub: 'The 5 people who visited each selected asset most', span: 6,
+      load: async () => {
+        const list = (await resolved()).filter((it) => it.kind === 'Asset');
+        if (!list.length) return { empty: { title: 'No assets selected', text: 'Visitor lists are available for assets only.' } };
+        const per = await Promise.all(list.map((it) => Data.assetVisitors(it.id, r, 5).catch(soft)));
+        const rows = list.flatMap((it, i) => (per[i] || []).map((v) => ({ item: it.name, rank: v.rank, id: v.id, name: v.name, visits: v.visits })));
+        if (!rows.length) return { empty: { title: 'No visitors', text: 'Nobody visited the selected assets in this period.' } };
+        return {
+          dataset: { columns: [{ key: 'item', label: 'Asset' }, { key: 'rank', label: '#', type: 'number' }, { key: 'name', label: 'User', link: (x) => (isUuid(x.id) ? Env.userUrl(x.id) : null) }, { key: 'visits', label: 'Visits', type: 'number', bar: true }], rows },
+          tableOpts: { pageSize: 10 },
+          calc: list.map((it, i) => `${it.name}: ${per[i] ? `${plural(per[i].length, 'visitor')} shown, ${fmtN(sum(per[i], (x) => x.visits))} visits between them` : 'visitor list unavailable'}.`),
+        };
+      },
+    });
+
+    const table = card(T, {
+      id: 'cp-table', title: 'Side-by-side comparison', sub: 'Usage, rank among peers, curation and freshness per item', span: 12,
+      load: async () => {
+        const [list, ed] = await Promise.all([resolved(), editsFor()]);
+        const kinds = uniq(list.map((it) => it.kind));
+        const details = Object.fromEntries(await Promise.all(kinds.map(async (k) => [k, await Data.contentDetail(k, r).catch(soft)])));
+        const selTotal = sum(list, (it) => sum(it.values));
+        const rows = await Promise.all(list.map(async (it, i) => {
+          const visits = sum(it.values);
+          const peers = details[it.kind];
+          const pos = peers ? peers.findIndex((x) => x.id === it.id) : -1;
+          const pct = peers && peers.length ? percentileRank(peers.map((x) => x.visits), visits) : null;
+          const act = it.values.filter((v) => v > 0).length;
+          const fi = it.values.findIndex((v) => v > 0), li = it.values.length - 1 - [...it.values].reverse().findIndex((v) => v > 0);
+          const row = {
+            id: it.id, kind: it.kind, name: it.name, context: it.context, visits, prev: it.prevTotal, delta: it.prevTotal ? pctChange(visits, it.prevTotal) : null,
+            share: selTotal ? (visits / selTotal) * 100 : 0, rank: pos >= 0 ? pos + 1 : null, peers: peers ? peers.length : null, pctl: pct,
+            activePct: (act / buckets.length) * 100, first: fi >= 0 ? buckets[fi].startDate : '', last: fi >= 0 ? buckets[li].startDate : '',
+            edits: ed[i] ? ed[i].total : null, ratio: ed[i] && visits ? ed[i].total / visits : null,
+            allTime: null, visitors: null, perVisitor: null, rating: null, ratings: null, modified: null, days: null, stale: '',
+          };
+          if (it.kind === 'Asset') {
+            const [sm, rt] = await Promise.all([Data.assetSummary(it.id).catch(soft), Api.get('/rest/2.0/ratings', { assetId: it.id, limit: 1000 }).catch(soft)]);
+            if (sm) { row.allTime = sm.totalVisitCount || 0; row.visitors = sm.uniqueVisitorCount || 0; row.perVisitor = row.visitors ? row.allTime / row.visitors : null; }
+            const rs = rt ? rt.results || [] : [];
+            row.ratings = rs.length;
+            row.rating = rs.length ? (sum(rs, (x) => x.rating) / rs.length) * 5 : null;
+            const mod = it.details && (it.details.modifiedOn || it.details.lastModifiedOn);
+            if (mod) {
+              row.modified = typeof mod === 'number' ? mod : Date.parse(mod);
+              row.days = Math.floor((Date.now() - row.modified) / DAY);
+              row.stale = row.days >= State.s.stale && pct != null && pct >= 80 ? 'Yes' : 'No';
+            }
+          }
+          return row;
+        }));
+        return {
+          dataset: {
+            columns: [
+              { key: 'name', label: 'Item', link: (x) => Env.urlFor(x.kind, x.id) },
+              { key: 'kind', label: 'Kind' },
+              { key: 'context', label: 'Type / location', hidden: true },
+              { key: 'visits', label: 'Visits', type: 'number', bar: true },
+              { key: 'prev', label: `Visits, ${State.compareLabel()}`, type: 'number', hidden: !cr },
+              { key: 'delta', label: 'Change %', type: 'delta', hidden: !cr, isNew: (x) => !x.prev && x.visits > 0 },
+              { key: 'share', label: 'Share of selection %', type: 'pct' },
+              { key: 'rank', label: 'Rank in kind', type: 'number', format: (v) => `#${fmtN(v)}`, sortValue: (x) => (x.rank == null ? null : -x.rank) },
+              { key: 'peers', label: 'Items of kind visited', type: 'number', hidden: true },
+              { key: 'pctl', label: 'Percentile', type: 'number', format: (v) => `${Math.round(v)}th` },
+              { key: 'activePct', label: `Active ${gl}s %`, type: 'pct' },
+              { key: 'first', label: `First active ${gl}`, type: 'date', hidden: true },
+              { key: 'last', label: `Last active ${gl}`, type: 'date' },
+              { key: 'allTime', label: 'All-time visits', type: 'number' },
+              { key: 'visitors', label: 'Unique visitors (all time)', type: 'number' },
+              { key: 'perVisitor', label: 'Visits per visitor', type: 'number', format: fmt1 },
+              { key: 'edits', label: 'Edits', type: 'number' },
+              { key: 'ratio', label: 'Edits per visit', type: 'number', format: (v) => v.toFixed(2) },
+              { key: 'rating', label: 'Rating', type: 'stars' },
+              { key: 'ratings', label: 'Ratings', type: 'number', hidden: true },
+              { key: 'modified', label: 'Last modified', type: 'datetime', hidden: true },
+              { key: 'days', label: 'Days since modified', type: 'number' },
+              { key: 'stale', label: `Stale but popular (\u2265${State.s.stale} d)` },
+            ],
+            rows,
+          },
+          tableOpts: { sort: 'visits', dir: 'desc', search: false },
+          calc: [
+            `${plural(rows.length, 'item')}; ${fmtN(selTotal)} visits between them.`,
+            'Rank in kind and percentile compare each item with every item of the same kind visited in the period (percentile = % of those items with fewer visits, counting ties as half).',
+            'All-time visits, unique visitors, rating and freshness are only available for assets.',
+            `Stale but popular = not modified for at least ${State.s.stale} days and in the top 20% of its kind by visits (percentile \u2265 80).`,
+            'Edits per visit = audit-trail edits in the period \u00f7 visits in the period.',
+          ],
+        };
+      },
+    });
+
+    panel.append(grid(trend), grid(table), grid(share, edits), grid(multiples), grid(visitors));
     runAll(T);
   }
 
@@ -4703,12 +6755,43 @@ ${built.map((_, i) => `<Relationship Id="rId${i + 1}" Type="http://schemas.openx
       },
     });
 
-    panel.append(kpis.el, grid(dist, overTime), grid(mostRated, avgCard), grid(table));
+    const coverage = card(T, {
+      id: 'rt-coverage', title: 'Rating coverage of popular assets', sub: 'Do the 100 most-visited assets in the date range have ratings?', span: 12, height: 220,
+      load: async () => {
+        if (!Env.caps.ua || Env.caps.uaForbidden) return { empty: { title: 'Needs Usage Analytics', text: 'Popularity in the date range comes from Usage Analytics, which isn\u2019t available.' } };
+        const [top, all] = await Promise.all([Data.contentDetail('Asset', r), data()]);
+        const list = top.slice(0, 100);
+        if (!list.length) return { empty: { title: 'No asset visits', text: 'No assets were visited in the selected date range.' } };
+        const by = groupBy(all, (x) => x.assetId);
+        const rows = list.map((x, i) => {
+          const rs = by.get(x.id) || [];
+          return { id: x.id, rank: i + 1, name: x.name, type: x.assetType, visits: x.visits, ratings: rs.length, avg: rs.length ? sum(rs, (y) => y.stars) / rs.length : null, rated: rs.length ? 'Yes' : 'No' };
+        });
+        const rated = rows.filter((x) => x.ratings).length;
+        return {
+          stats: [{ label: 'Coverage', value: (rated / rows.length) * 100, display: fmtPct((rated / rows.length) * 100, 0), primary: true }, { label: 'Rated', value: rated }, { label: 'Unrated', value: rows.length - rated }, { label: 'Unrated visits', value: sum(rows.filter((x) => !x.ratings), (x) => x.visits), hint: 'Visits to popular assets that nobody has rated' }],
+          spec: { kind: 'donut', title: 'Rating coverage', items: [{ label: 'Rated', value: rated, color: Theme.v('--good') }, { label: 'Not rated', value: rows.length - rated, color: Theme.v('--text-3') }], centerLabel: 'top assets', valueLabel: 'Assets' },
+          dataset: {
+            columns: [{ key: 'rank', label: 'Visit rank', type: 'number' }, { key: 'name', label: 'Asset', link: (x) => Env.assetUrl(x.id) }, { key: 'type', label: 'Asset type' }, { key: 'visits', label: 'Visits', type: 'number', bar: true },
+              { key: 'rated', label: 'Rated' }, { key: 'ratings', label: 'Ratings', type: 'number' }, { key: 'avg', label: 'Average', type: 'stars' }],
+            rows,
+          },
+          tableOpts: { sort: 'rank', dir: 'asc', onRowClick: (x) => openAsset(x.id) },
+          calc: [
+            `${fmtN(rated)} of the ${fmtN(rows.length)} most-visited assets (${fmtRange(r.startDate, r.endDate)}) have at least one rating = ${fmtPct((rated / rows.length) * 100)}.`,
+            `Ratings counted: ${scope === 'all' ? 'all time' : 'given in the date range'} (follows the Scope switch).`,
+            `The ${fmtN(rows.length - rated)} unrated assets got ${fmtN(sum(rows.filter((x) => !x.ratings), (x) => x.visits))} visits: good candidates to ask for ratings.`,
+          ],
+        };
+      },
+    });
+
+    panel.append(kpis.el, grid(dist, overTime), grid(mostRated, avgCard), grid(coverage), grid(table));
     runAll(T);
   }
 
-  const TABS = { overview: buildOverview, content: buildContent, users: buildUsers, asset: buildAsset, popularity: buildPopularity, activity: buildActivity, ratings: buildRatings };
-  const UA_TABS = ['overview', 'content', 'users'];
+  const TABS = { overview: buildOverview, content: buildContent, dashboards: buildDashboards, users: buildUsers, asset: buildAsset, compare: buildCompare, popularity: buildPopularity, activity: buildActivity, ratings: buildRatings };
+  const UA_TABS = ['overview', 'content', 'dashboards', 'users', 'compare'];
 
   /* ────────────────────────────────────────────────────────────────────────
      Global controls
@@ -4742,7 +6825,7 @@ ${built.map((_, i) => `<Relationship Id="rId${i + 1}" Type="http://schemas.openx
 
       $('#btn-reset').addEventListener('click', () => {
         const d = JSON.parse(JSON.stringify(DEFAULTS));
-        App.update({ ...d, tab: State.s.tab, asset: State.s.asset });
+        App.update({ ...d, tab: State.s.tab, asset: State.s.asset, items: State.s.items, users: State.s.users });
         toast('Filters reset');
       });
       $('#btn-share').addEventListener('click', async () => {
@@ -4923,7 +7006,12 @@ ${built.map((_, i) => `<Relationship Id="rId${i + 1}" Type="http://schemas.openx
      App controller
      ──────────────────────────────────────────────────────────────────────── */
 
-  const LOCAL_KEYS = { ctype: 'content', utype: 'users', asset: 'asset', popN: 'popularity', actCap: 'activity', cause: 'activity', rscope: 'ratings' };
+  const LOCAL_KEYS = {
+    ctype: 'content', stale: 'content', utype: 'users', users: 'users', asset: 'asset', popN: 'popularity', actCap: 'activity', cause: 'activity', rscope: 'ratings',
+    dsel: 'dashboards', dmin: 'dashboards', dtop: 'dashboards', items: 'compare', cmetric: 'compare', cnorm: 'compare', cbench: 'compare',
+  };
+  /** View-only keys that just re-run specific widgets instead of rebuilding their tab. */
+  const RERUN_KEYS = { mixOff: ['ov-mix', 'ov-trend'] };
 
   const App = {
     dirty: new Set(TAB_IDS),
@@ -4945,6 +7033,7 @@ ${built.map((_, i) => `<Relationship Id="rId${i + 1}" Type="http://schemas.openx
         if (['range', 'from', 'to'].some((k) => changed.includes(k))) Controls.loadLists();
       } else {
         changed.forEach((k) => { if (LOCAL_KEYS[k]) this.dirty.add(LOCAL_KEYS[k]); });
+        changed.forEach((k) => (RERUN_KEYS[k] || []).forEach((id) => TAB_IDS.forEach((t) => Widgets.all(t).filter((w) => w.opts && w.opts.id === id).forEach((w) => w.run()))));
       }
       Controls.sync();
       exitFullscreen();
@@ -4992,7 +7081,7 @@ ${built.map((_, i) => `<Relationship Id="rId${i + 1}" Type="http://schemas.openx
     },
 
     help() {
-      const rows = [['1 – 7', 'Switch tabs'], ['R', 'Refresh all data'], ['T', 'Toggle dark mode'], ['/', 'Search assets (Asset Explorer)'], ['I', 'How the focused chart or metric is calculated'], ['?', 'This help'], ['Esc', 'Close menus, dialogs and fullscreen']];
+      const rows = [['1 – 9', 'Switch tabs'], ['R', 'Refresh all data'], ['T', 'Toggle dark mode'], ['/', 'Search assets (Asset Explorer)'], ['I', 'How the focused chart or metric is calculated'], ['?', 'This help'], ['Esc', 'Close menus, dialogs and fullscreen']];
       Modal.show('Help', h('div', null,
         h('table', { class: 'shortcuts' }, h('tbody', null, rows.map(([k, v]) => h('tr', null, h('td', null, h('span', { class: 'kbd' }, k)), h('td', null, v))))),
         h('h3', { style: { fontSize: '14px', margin: '18px 0 6px' } }, 'Connection'),
@@ -5003,7 +7092,7 @@ ${built.map((_, i) => `<Relationship Id="rId${i + 1}" Type="http://schemas.openx
           h('li', null, 'Usage Analytics (internal): visits, users, per-asset usage and row-level detail downloads'),
           h('li', null, 'REST 2.0: navigation statistics, activities (audit trail), ratings, users, assets'),
           h('li', null, 'GraphQL Knowledge Graph: asset type, status, domain and community enrichment')),
-        h('p', { class: 'hint' }, 'Tip: click \u24d8 on any metric or chart to see exactly how it\u2019s calculated, with the current numbers. Every chart has its own export menu (PNG, JPEG, SVG, PDF, print, CSV, Excel, JSON). Click legend items to hide series; click bars and periods to drill down.')));
+        h('p', { class: 'hint' }, 'Tip: click \u24d8 on any metric or chart to see exactly how it\u2019s calculated, with the current numbers. Every chart has its own export menu (PNG, JPEG, SVG, PDF, print, CSV, Excel, JSON); Excel, JSON and print exports include the calculation notes. Click legend items to hide series; click bars and periods to drill down.')));
     },
   };
 
@@ -5016,9 +7105,9 @@ ${built.map((_, i) => `<Relationship Id="rId${i + 1}" Type="http://schemas.openx
     if (e.key === 'Escape') { Menus.close(); Modal.hide(); exitFullscreen(); Tip.hide(); return; }
     if (e.target.closest('input, select, textarea, [contenteditable]') || e.ctrlKey || e.metaKey || e.altKey) return;
     if (!$('#modal').hidden || !$('#connect').hidden || !Env.base) return;
-    if (/^[1-7]$/.test(e.key)) {
+    if (/^[1-9]$/.test(e.key)) {
       const t = TAB_IDS[Number(e.key) - 1];
-      if (!$(`#tab-${t}`).hidden) App.update({ tab: t });
+      if (t && !$(`#tab-${t}`).hidden) App.update({ tab: t });
     } else if (e.key === 'r' || e.key === 'R') App.refresh();
     else if (e.key === 't' || e.key === 'T') App.toggleTheme();
     else if (e.key === 'i' || e.key === 'I') {
